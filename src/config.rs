@@ -34,11 +34,11 @@ impl AppConfig {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot find config directory"))?
             .join("openvpn3-gui");
-        
+
         std::fs::create_dir_all(&config_dir)?;
-        
+
         let config_file = config_dir.join("config.json");
-        
+
         if config_file.exists() {
             let content = std::fs::read_to_string(config_file)?;
             Ok(serde_json::from_str(&content)?)
@@ -46,18 +46,18 @@ impl AppConfig {
             Ok(Self::default())
         }
     }
-    
+
     pub fn save(&self) -> anyhow::Result<()> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot find config directory"))?
             .join("openvpn3-gui");
-        
+
         std::fs::create_dir_all(&config_dir)?;
-        
+
         let config_file = config_dir.join("config.json");
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(config_file, content)?;
-        
+
         Ok(())
     }
 }

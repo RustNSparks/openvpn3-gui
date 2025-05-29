@@ -1,9 +1,12 @@
-// src/app.rs (Cleaned up version)
+// src/app.rs (Fixed all borrow checker issues)
+use crate::config::AppConfig;
+use crate::openvpn::{
+    ConfigProfile, ConnectionStatus, OpenVPN3Manager, SessionInfo, SessionStats, VpnCommand,
+    VpnMessage,
+};
 use eframe::egui;
 use std::sync::mpsc;
 use tokio::runtime::Runtime;
-use crate::config::{AppConfig, VpnConfig};
-use crate::openvpn::{OpenVPN3Manager, VpnMessage, VpnCommand, ConnectionStatus, SessionInfo, SessionStats, ConfigProfile};
 
 #[derive(PartialEq)]
 enum ActiveTab {
@@ -24,26 +27,44 @@ pub struct OpenVPN3App {
 
     // UI State
     active_tab: ActiveTab,
-    selected_config: Option<usize>,
+    selected_config_idx: Option<usize>,
+
+    // Import Config Dialog
     show_import_config_dialog: bool,
     import_config_path: String,
     import_config_name: String,
+
+    // Config Dump Dialog
+    show_config_dump_dialog: bool,
+    dumped_config_name: String,
+    dumped_config_content: String,
+
+    // Authentication Dialog
+    show_auth_dialog: bool,
+    auth_session_path: Option<String>,
+    auth_prompt_message: String,
+    auth_input_response: String,
+
     connection_status: ConnectionStatus,
     log_messages: Vec<String>,
     manager_started: bool,
 
-    // Data
+    // Data from VPN Manager
     sessions_list: Vec<SessionInfo>,
     configs_list: Vec<ConfigProfile>,
     session_stats: Option<SessionStats>,
-    real_time_logging: bool,
+    vpn_cli_version: Option<String>,
+
+    // Logging toggles
+    live_vpn_logs_active: bool,
+    manager_log_buffer_active: bool,
 }
 
 impl OpenVPN3App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let config = AppConfig::load().unwrap_or_default();
         let (message_tx, message_rx) = mpsc::channel();
-        let runtime = Runtime::new().unwrap();
+        let runtime = Runtime::new().expect("Failed to create Tokio runtime");
 
         Self {
             config,
@@ -52,17 +73,32 @@ impl OpenVPN3App {
             message_rx,
             message_tx,
             active_tab: ActiveTab::Connection,
-            selected_config: None,
+            selected_config_idx: None,
+
             show_import_config_dialog: false,
             import_config_path: String::new(),
             import_config_name: String::new(),
+
+            show_config_dump_dialog: false,
+            dumped_config_name: String::new(),
+            dumped_config_content: String::new(),
+
+            show_auth_dialog: false,
+            auth_session_path: None,
+            auth_prompt_message: String::new(),
+            auth_input_response: String::new(),
+
             connection_status: ConnectionStatus::Disconnected,
             log_messages: Vec::new(),
             manager_started: false,
+
             sessions_list: Vec::new(),
             configs_list: Vec::new(),
             session_stats: None,
-            real_time_logging: false,
+            vpn_cli_version: None,
+
+            live_vpn_logs_active: false,
+            manager_log_buffer_active: true,
         }
     }
 
@@ -77,12 +113,32 @@ impl OpenVPN3App {
 
             self.vpn_manager = Some(manager);
             self.manager_started = true;
+            self.add_log_entry("VPN Manager started.".to_string());
 
-            // Load initial data
+            // Load initial data & set initial log states
             if let Some(ref manager) = self.vpn_manager {
                 let _ = manager.list_configs();
                 let _ = manager.list_sessions();
+                let _ = manager.get_vpn_cli_version();
+
+                if self.live_vpn_logs_active {
+                    let _ = manager.start_live_vpn_logs();
+                }
+                if self.manager_log_buffer_active {
+                    let _ = manager.enable_manager_log_buffer();
+                } else {
+                    let _ = manager.disable_manager_log_buffer();
+                }
             }
+        }
+    }
+
+    fn add_log_entry(&mut self, message: String) {
+        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.log_messages
+            .push(format!("[{}] {}", timestamp, message));
+        if self.log_messages.len() > 1000 {
+            self.log_messages.remove(0);
         }
     }
 
@@ -90,18 +146,26 @@ impl OpenVPN3App {
         while let Ok(message) = self.message_rx.try_recv() {
             match message {
                 VpnMessage::StatusUpdate(status) => {
-                    self.connection_status = status;
+                    self.connection_status = status.clone();
+                    if let ConnectionStatus::AuthenticationRequired {
+                        session_path,
+                        prompt,
+                    } = status
+                    {
+                        self.auth_session_path = Some(session_path);
+                        self.auth_prompt_message = prompt;
+                        self.auth_input_response.clear();
+                        self.show_auth_dialog = true;
+                    }
                 }
                 VpnMessage::LogMessage(msg) => {
-                    self.log_messages.push(format!("[{}] {}",
-                                                   chrono::Local::now().format("%H:%M:%S"), msg));
+                    self.log_messages.push(msg);
                     if self.log_messages.len() > 1000 {
                         self.log_messages.remove(0);
                     }
                 }
-                VpnMessage::Error(err) => {
-                    self.log_messages.push(format!("[{}] Error: {}",
-                                                   chrono::Local::now().format("%H:%M:%S"), err));
+                VpnMessage::Error(err_msg) => {
+                    self.add_log_entry(format!("[MANAGER ERROR] {}", err_msg));
                 }
                 VpnMessage::SessionsList(sessions) => {
                     self.sessions_list = sessions;
@@ -113,8 +177,33 @@ impl OpenVPN3App {
                     self.configs_list = configs;
                 }
                 VpnMessage::ConfigImported(msg) => {
-                    self.log_messages.push(format!("[{}] Config imported: {}",
-                                                   chrono::Local::now().format("%H:%M:%S"), msg));
+                    self.add_log_entry(format!("Config imported: {}", msg));
+                }
+                VpnMessage::VpnCliVersion(version) => {
+                    self.vpn_cli_version = Some(version);
+                }
+                VpnMessage::ConfigDumped { name, content } => {
+                    self.dumped_config_name = name;
+                    self.dumped_config_content = content;
+                    self.show_config_dump_dialog = true;
+                }
+                VpnMessage::AuthenticationPrompt {
+                    session_path,
+                    prompt,
+                } => {
+                    self.auth_session_path = Some(session_path.clone());
+                    self.auth_prompt_message = prompt.clone();
+                    self.auth_input_response.clear();
+                    self.show_auth_dialog = true;
+                    if !matches!(
+                        self.connection_status,
+                        ConnectionStatus::AuthenticationRequired { .. }
+                    ) {
+                        self.connection_status = ConnectionStatus::AuthenticationRequired {
+                            session_path,
+                            prompt,
+                        };
+                    }
                 }
             }
         }
@@ -124,7 +213,11 @@ impl OpenVPN3App {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.active_tab, ActiveTab::Connection, "Connection");
             ui.selectable_value(&mut self.active_tab, ActiveTab::Sessions, "Sessions");
-            ui.selectable_value(&mut self.active_tab, ActiveTab::Configurations, "Configurations");
+            ui.selectable_value(
+                &mut self.active_tab,
+                ActiveTab::Configurations,
+                "Configurations",
+            );
             ui.selectable_value(&mut self.active_tab, ActiveTab::Statistics, "Statistics");
             ui.selectable_value(&mut self.active_tab, ActiveTab::Logs, "Logs");
             ui.selectable_value(&mut self.active_tab, ActiveTab::Settings, "Settings");
@@ -138,59 +231,87 @@ impl OpenVPN3App {
         // Connection status
         ui.horizontal(|ui| {
             ui.label("Status:");
-            let (text, color) = match &self.connection_status {
-                ConnectionStatus::Disconnected => ("Disconnected", egui::Color32::RED),
-                ConnectionStatus::Connecting => ("Connecting...", egui::Color32::YELLOW),
-                ConnectionStatus::Connected { ip, duration } => {
-                    ui.label(format!("IP: {}, Duration: {}", ip, duration));
-                    ("Connected", egui::Color32::GREEN)
+            let (text_display, color) = match &self.connection_status {
+                ConnectionStatus::Disconnected => ("Disconnected".to_string(), egui::Color32::RED),
+                ConnectionStatus::Connecting => ("Connecting...".to_string(), egui::Color32::KHAKI),
+                ConnectionStatus::Connected { ip, duration } => (
+                    format!("Connected (IP: {}, Duration: {})", ip, duration),
+                    egui::Color32::GREEN,
+                ),
+                ConnectionStatus::Disconnecting => {
+                    ("Disconnecting...".to_string(), egui::Color32::KHAKI)
                 }
-                ConnectionStatus::Disconnecting => ("Disconnecting...", egui::Color32::YELLOW),
-                ConnectionStatus::Error(err) => {
-                    ui.label(format!("Error: {}", err));
-                    ("Error", egui::Color32::RED)
-                }
+                ConnectionStatus::Error(err) => (format!("Error: {}", err), egui::Color32::RED),
+                ConnectionStatus::AuthenticationRequired { prompt, .. } => (
+                    format!("Authentication Required: {}", prompt),
+                    egui::Color32::LIGHT_BLUE,
+                ),
             };
-            ui.colored_label(color, text);
+            ui.colored_label(color, text_display);
         });
+
+        if matches!(
+            self.connection_status,
+            ConnectionStatus::AuthenticationRequired { .. }
+        ) {
+            if ui.button("Enter Credentials").clicked() {
+                self.show_auth_dialog = true;
+            }
+        }
 
         ui.separator();
 
-        // Configuration selection from imported configs
+        // Configuration selection
         ui.horizontal(|ui| {
             ui.label("Configuration:");
-            egui::ComboBox::from_label("")
-                .selected_text(
-                    self.selected_config
-                        .and_then(|i| self.configs_list.get(i))
-                        .map(|c| c.name.as_str())
-                        .unwrap_or("Select configuration")
-                )
+            let selected_text = self
+                .selected_config_idx
+                .and_then(|idx| self.configs_list.get(idx))
+                .map_or("Select configuration", |c| &c.name);
+
+            egui::ComboBox::from_id_source("config_combobox")
+                .selected_text(selected_text)
                 .show_ui(ui, |ui| {
-                    for (i, config) in self.configs_list.iter().enumerate() {
-                        ui.selectable_value(&mut self.selected_config, Some(i), &config.name);
+                    for (i, config_profile) in self.configs_list.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.selected_config_idx,
+                            Some(i),
+                            &config_profile.name,
+                        );
                     }
                 });
         });
 
-        // Connection controls
+        // Connection controls - fix borrow checker issue
         ui.horizontal(|ui| {
-            let can_connect = matches!(self.connection_status, ConnectionStatus::Disconnected)
-                && self.selected_config.is_some();
+            let can_connect = (matches!(self.connection_status, ConnectionStatus::Disconnected)
+                || matches!(self.connection_status, ConnectionStatus::Error(_)))
+                && self.selected_config_idx.is_some();
+
             let can_disconnect = matches!(
-                self.connection_status, 
-                ConnectionStatus::Connected { .. } | ConnectionStatus::Connecting
+                self.connection_status,
+                ConnectionStatus::Connected { .. }
+                    | ConnectionStatus::Connecting
+                    | ConnectionStatus::AuthenticationRequired { .. }
             );
 
-            if ui.add_enabled(can_connect, egui::Button::new("Connect")).clicked() {
-                if let Some(config_idx) = self.selected_config {
-                    if let Some(config) = self.configs_list.clone().get(config_idx) {
-                        self.connect_vpn(&config.path);
+            if ui
+                .add_enabled(can_connect, egui::Button::new("Connect"))
+                .clicked()
+            {
+                if let Some(idx) = self.selected_config_idx {
+                    // Get the config name first, then call the method
+                    let config_name = self.configs_list.get(idx).map(|c| c.name.clone());
+                    if let Some(name) = config_name {
+                        self.connect_vpn(&name);
                     }
                 }
             }
 
-            if ui.add_enabled(can_disconnect, egui::Button::new("Disconnect")).clicked() {
+            if ui
+                .add_enabled(can_disconnect, egui::Button::new("Disconnect"))
+                .clicked()
+            {
                 self.disconnect_vpn();
             }
 
@@ -204,28 +325,24 @@ impl OpenVPN3App {
 
     fn draw_sessions_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Active Sessions");
-
-        ui.horizontal(|ui| {
-            if ui.button("Refresh Sessions").clicked() {
-                if let Some(ref manager) = self.vpn_manager {
-                    let _ = manager.list_sessions();
-                }
+        if ui.button("Refresh Sessions").clicked() {
+            if let Some(ref manager) = self.vpn_manager {
+                let _ = manager.list_sessions();
             }
-        });
-
+        }
         ui.separator();
 
         if self.sessions_list.is_empty() {
-            ui.label("No active sessions");
+            ui.label("No active OpenVPN3 sessions found by the manager.");
         } else {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for session in &self.sessions_list {
                     ui.group(|ui| {
-                        ui.label(format!("Config: {}", session.config_name));
+                        ui.label(format!("Config Name: {}", session.config_name));
+                        ui.label(format!("Session Path: {}", session.session_path));
                         ui.label(format!("Status: {}", session.status));
                         ui.label(format!("Created: {}", session.created));
                         ui.label(format!("Owner: {}", session.owner));
-                        ui.label(format!("Path: {}", session.session_path));
                     });
                 }
             });
@@ -233,61 +350,90 @@ impl OpenVPN3App {
     }
 
     fn draw_configurations_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Configuration Management");
-
+        ui.heading("Configuration Profiles");
         ui.horizontal(|ui| {
-            if ui.button("Import Config").clicked() {
+            if ui.button("Import Config File").clicked() {
                 self.show_import_config_dialog = true;
             }
-
-            if ui.button("Refresh Configs").clicked() {
+            if ui.button("Refresh List").clicked() {
                 if let Some(ref manager) = self.vpn_manager {
                     let _ = manager.list_configs();
                 }
             }
         });
-
         ui.separator();
 
         if self.configs_list.is_empty() {
-            ui.label("No configurations imported");
+            ui.label("No configurations found by the manager.");
         } else {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for config in &self.configs_list.clone() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(format!("Name: {}", config.name));
-                                ui.label(format!("Imported: {}", config.import_time));
-                                ui.label(format!("Owner: {}", config.owner));
-                                ui.label(format!("Path: {}", config.path));
-                            });
+            // Collect actions outside of the borrow
+            let mut action_remove: Option<String> = None;
+            let mut action_dump: Option<String> = None;
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Remove").clicked() {
-                                    if let Some(ref manager) = self.vpn_manager {
-                                        let _ = manager.remove_config(config.path.clone());
-                                    }
-                                }
-                            });
+            // Create a clone of configs_list to avoid borrowing issues
+            let configs_clone = self.configs_list.clone();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for config_profile in &configs_clone {
+                    ui.group(|ui| {
+                        ui.label(format!("Name: {}", config_profile.name));
+                        ui.label(format!("Path: {}", config_profile.path));
+                        ui.label(format!("Imported: {}", config_profile.import_time));
+                        ui.label(format!("Owner: {}", config_profile.owner));
+                        ui.label(format!("Valid: {}", config_profile.valid));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Remove")
+                                .on_hover_text("Remove this configuration")
+                                .clicked()
+                            {
+                                action_remove = Some(config_profile.path.clone());
+                            }
+                            if ui
+                                .button("View/Dump")
+                                .on_hover_text("View raw configuration content")
+                                .clicked()
+                            {
+                                action_dump = Some(config_profile.path.clone());
+                            }
                         });
                     });
                 }
             });
+
+            // Perform actions after the ScrollArea scope - fix borrow checker issues
+            if let Some(config_path_to_remove) = action_remove {
+                // Get manager first, then do operations that need mutable borrow
+                let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                if let Some(manager) = manager {
+                    self.add_log_entry(format!(
+                        "Requesting removal of config: {}",
+                        config_path_to_remove
+                    ));
+                    let _ = manager.remove_config(config_path_to_remove);
+                }
+            }
+            if let Some(config_path_to_dump) = action_dump {
+                // Get manager first, then do operations that need mutable borrow
+                let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                if let Some(manager) = manager {
+                    self.add_log_entry(format!(
+                        "Requesting dump of config: {}",
+                        config_path_to_dump
+                    ));
+                    let _ = manager.dump_config(config_path_to_dump);
+                }
+            }
         }
     }
 
     fn draw_statistics_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Connection Statistics");
-
-        ui.horizontal(|ui| {
-            if ui.button("Refresh Stats").clicked() {
-                if let Some(ref manager) = self.vpn_manager {
-                    let _ = manager.get_session_stats();
-                }
+        if ui.button("Refresh Stats").clicked() {
+            if let Some(ref manager) = self.vpn_manager {
+                let _ = manager.get_session_stats();
             }
-        });
-
+        }
         ui.separator();
 
         if let Some(ref stats) = self.session_stats {
@@ -297,37 +443,77 @@ impl OpenVPN3App {
                 ui.label(format!("Remote IP: {}", stats.remote_ip));
                 ui.label(format!("Connected Since: {}", stats.connected_since));
             });
-
             ui.group(|ui| {
                 ui.label("Traffic Statistics:");
-                ui.label(format!("Bytes Received: {}", Self::format_bytes(stats.bytes_in)));
-                ui.label(format!("Bytes Sent: {}", Self::format_bytes(stats.bytes_out)));
+                ui.label(format!(
+                    "Bytes Received: {}",
+                    Self::format_bytes(stats.bytes_in)
+                ));
+                ui.label(format!(
+                    "Bytes Sent: {}",
+                    Self::format_bytes(stats.bytes_out)
+                ));
                 ui.label(format!("Packets Received: {}", stats.packets_in));
                 ui.label(format!("Packets Sent: {}", stats.packets_out));
             });
         } else {
-            ui.label("No statistics available (not connected)");
+            ui.label("No statistics available (not connected or no active session).");
         }
     }
 
     fn draw_logs_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Logs");
+        ui.heading("Application & VPN Logs");
+
+        // Store the manager reference and checkbox states separately to avoid borrowing issues
+        let manager_exists = self.vpn_manager.is_some();
+        let mut live_logs_changed = false;
+        let mut manager_logs_changed = false;
 
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut self.real_time_logging, "Real-time logging").changed() {
-                if let Some(ref manager) = self.vpn_manager {
-                    if self.real_time_logging {
-                        let _ = manager.start_logging();
-                    } else {
-                        let _ = manager.stop_logging();
-                    }
-                }
+            if ui
+                .checkbox(
+                    &mut self.live_vpn_logs_active,
+                    "Stream Live VPN Logs (`openvpn3 log`)",
+                )
+                .changed()
+            {
+                live_logs_changed = true;
             }
-
-            if ui.button("Clear Logs").clicked() {
+            if ui
+                .checkbox(
+                    &mut self.manager_log_buffer_active,
+                    "Enable Internal Manager Logs",
+                )
+                .changed()
+            {
+                manager_logs_changed = true;
+            }
+            if ui.button("Clear Displayed Logs").clicked() {
                 self.log_messages.clear();
             }
         });
+
+        // Handle checkbox changes after the UI section
+        if manager_exists {
+            if live_logs_changed {
+                if let Some(ref manager) = self.vpn_manager {
+                    if self.live_vpn_logs_active {
+                        let _ = manager.start_live_vpn_logs();
+                    } else {
+                        let _ = manager.stop_live_vpn_logs();
+                    }
+                }
+            }
+            if manager_logs_changed {
+                if let Some(ref manager) = self.vpn_manager {
+                    if self.manager_log_buffer_active {
+                        let _ = manager.enable_manager_log_buffer();
+                    } else {
+                        let _ = manager.disable_manager_log_buffer();
+                    }
+                }
+            }
+        }
 
         ui.separator();
 
@@ -342,20 +528,35 @@ impl OpenVPN3App {
     }
 
     fn draw_settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-
+        ui.heading("Application Settings");
         ui.group(|ui| {
-            ui.label("Application Settings:");
-            ui.checkbox(&mut self.config.auto_start, "Auto start with system");
-            ui.checkbox(&mut self.config.minimize_to_tray, "Minimize to tray");
-        });
-
-        ui.horizontal(|ui| {
-            if ui.button("Save Settings").clicked() {
+            ui.label("General Settings:");
+            ui.checkbox(
+                &mut self.config.auto_start,
+                "Auto start with system (Not implemented)",
+            );
+            ui.checkbox(
+                &mut self.config.minimize_to_tray,
+                "Minimize to tray (Not implemented)",
+            );
+            if ui.button("Save App Settings").clicked() {
                 if let Err(e) = self.config.save() {
-                    self.log_messages.push(format!("Failed to save settings: {}", e));
+                    self.add_log_entry(format!("Failed to save settings: {}", e));
                 } else {
-                    self.log_messages.push("Settings saved successfully".to_string());
+                    self.add_log_entry("Settings saved successfully.".to_string());
+                }
+            }
+        });
+        ui.group(|ui| {
+            ui.label("OpenVPN3 Information:");
+            if let Some(version) = &self.vpn_cli_version {
+                ui.label(format!("CLI Version: {}", version));
+            } else {
+                ui.label("CLI Version: Unknown");
+            }
+            if ui.button("Refresh CLI Version").clicked() {
+                if let Some(ref manager) = self.vpn_manager {
+                    let _ = manager.get_vpn_cli_version();
                 }
             }
         });
@@ -363,17 +564,20 @@ impl OpenVPN3App {
 
     fn draw_import_config_dialog(&mut self, ctx: &egui::Context) {
         if self.show_import_config_dialog {
-            egui::Window::new("Import Configuration")
+            egui::Window::new("Import Configuration File")
                 .collapsible(false)
                 .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("Configuration Name:");
+                    ui.label("Configuration Name (for display):");
                     ui.text_edit_singleline(&mut self.import_config_name);
-
-                    ui.label("Config File Path:");
+                    ui.add_space(5.0);
+                    ui.label("Config File Path (.ovpn):");
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.import_config_path);
-                        if ui.button("Browse").clicked() {
+                        let text_edit = egui::TextEdit::singleline(&mut self.import_config_path)
+                            .desired_width(300.0);
+                        ui.add(text_edit);
+                        if ui.button("Browse...").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("OpenVPN Config", &["ovpn", "conf"])
                                 .pick_file()
@@ -382,60 +586,166 @@ impl OpenVPN3App {
                             }
                         }
                     });
-
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Import").clicked() && !self.import_config_name.is_empty() && !self.import_config_path.is_empty() {
-                            if let Some(ref manager) = self.vpn_manager {
+                        if ui.button("Import").clicked() {
+                            if self.import_config_name.is_empty() {
+                                self.add_log_entry(
+                                    "Import failed: Configuration name cannot be empty."
+                                        .to_string(),
+                                );
+                            } else if self.import_config_path.is_empty() {
+                                self.add_log_entry(
+                                    "Import failed: Configuration file path cannot be empty."
+                                        .to_string(),
+                                );
+                            } else if let Some(ref manager) = self.vpn_manager {
                                 let _ = manager.import_config(
                                     self.import_config_path.clone(),
-                                    self.import_config_name.clone()
+                                    self.import_config_name.clone(),
                                 );
+                                self.show_import_config_dialog = false;
+                                self.import_config_name.clear();
+                                self.import_config_path.clear();
                             }
-
-                            self.import_config_name.clear();
-                            self.import_config_path.clear();
-                            self.show_import_config_dialog = false;
                         }
-
                         if ui.button("Cancel").clicked() {
+                            self.show_import_config_dialog = false;
                             self.import_config_name.clear();
                             self.import_config_path.clear();
-                            self.show_import_config_dialog = false;
                         }
                     });
                 });
         }
     }
 
-    fn connect_vpn(&mut self, config_path: &str) {
-        self.ensure_manager_started();
+    fn draw_config_dump_dialog(&mut self, ctx: &egui::Context) {
+        if self.show_config_dump_dialog {
+            egui::Window::new(format!("Configuration: {}", self.dumped_config_name))
+                .default_size([600.0, 400.0])
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(true)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        ui.label(egui::RichText::new(&self.dumped_config_content).monospace());
+                    });
+                    ui.add_space(10.0);
+                    if ui.button("Close").clicked() {
+                        self.show_config_dump_dialog = false;
+                        self.dumped_config_name.clear();
+                        self.dumped_config_content.clear();
+                    }
+                });
+        }
+    }
 
-        if let Some(manager) = &self.vpn_manager {
-            if let Err(e) = manager.connect(config_path.to_string()) {
-                self.log_messages.push(format!("Failed to send connect command: {}", e));
+    fn draw_authentication_dialog(&mut self, ctx: &egui::Context) {
+        if self.show_auth_dialog {
+            egui::Window::new("VPN Authentication Required")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("The VPN connection requires authentication.");
+                    ui.add_space(5.0);
+                    // Fixed: Call wrap() on RichText, not on the Response
+                    ui.label(egui::RichText::new(&self.auth_prompt_message).strong());
+                    ui.add_space(5.0);
+                    ui.label("Response:");
+
+                    let is_password_prompt =
+                        self.auth_prompt_message.to_lowercase().contains("password");
+                    let text_edit_response = if is_password_prompt {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.auth_input_response)
+                                .password(true),
+                        )
+                    } else {
+                        ui.text_edit_singleline(&mut self.auth_input_response)
+                    };
+
+                    if text_edit_response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        // Get manager and session path first to avoid borrow conflicts
+                        let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                        let session_path = self.auth_session_path.clone();
+                        if let (Some(manager), Some(session_path)) = (manager, session_path) {
+                            let _ = manager.submit_authentication(
+                                session_path,
+                                self.auth_input_response.clone(),
+                            );
+                        }
+                        self.show_auth_dialog = false;
+                    }
+                    text_edit_response.request_focus();
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Submit").clicked() {
+                            // Get manager and session path first to avoid borrow conflicts
+                            let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                            let session_path = self.auth_session_path.clone();
+                            if let (Some(manager), Some(session_path)) = (manager, session_path) {
+                                let _ = manager.submit_authentication(
+                                    session_path,
+                                    self.auth_input_response.clone(),
+                                );
+                            }
+                            self.show_auth_dialog = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_auth_dialog = false;
+                            self.add_log_entry("Authentication cancelled by user.".to_string());
+                            if matches!(
+                                self.connection_status,
+                                ConnectionStatus::AuthenticationRequired { .. }
+                            ) {
+                                self.disconnect_vpn();
+                            }
+                        }
+                    });
+                });
+        }
+    }
+
+    fn connect_vpn(&mut self, config_identifier: &str) {
+        self.ensure_manager_started();
+        // Get manager first to avoid borrow conflicts
+        let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+        if let Some(manager) = manager {
+            self.add_log_entry(format!(
+                "Sending connect command for: {}",
+                config_identifier
+            ));
+            if let Err(e) = manager.connect(config_identifier.to_string()) {
+                self.add_log_entry(format!("Failed to send connect command: {}", e));
             }
         }
     }
 
     fn disconnect_vpn(&mut self) {
-        if let Some(manager) = &self.vpn_manager {
+        // Get manager first to avoid borrow conflicts
+        let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+        if let Some(manager) = manager {
+            self.add_log_entry("Sending disconnect command.".to_string());
             if let Err(e) = manager.disconnect() {
-                self.log_messages.push(format!("Failed to send disconnect command: {}", e));
+                self.add_log_entry(format!("Failed to send disconnect command: {}", e));
             }
         }
     }
 
     fn format_bytes(bytes: u64) -> String {
-        const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-        let mut size = bytes as f64;
-        let mut unit_index = 0;
-
-        while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-            size /= 1024.0;
-            unit_index += 1;
+        const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+        if bytes == 0 {
+            return "0 B".to_string();
         }
-
-        format!("{:.2} {}", size, UNITS[unit_index])
+        let i = (bytes as f64).log2() / 10.0;
+        let i = i.floor() as usize;
+        let i = if i >= UNITS.len() { UNITS.len() - 1 } else { i };
+        let size = bytes as f64 / (1024.0_f64.powi(i as i32));
+        format!("{:.2} {}", size, UNITS.get(i).unwrap_or(&"B"))
     }
 }
 
@@ -458,14 +768,21 @@ impl eframe::App for OpenVPN3App {
         });
 
         self.draw_import_config_dialog(ctx);
+        self.draw_config_dump_dialog(ctx);
+        self.draw_authentication_dialog(ctx);
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Clean shutdown
+        self.add_log_entry("Application exiting. Shutting down VPN manager.".to_string());
         if let Some(ref manager) = self.vpn_manager {
-            let _ = manager.shutdown();
+            if let Err(e) = manager.shutdown() {
+                eprintln!("Failed to send shutdown command to manager: {}", e);
+            }
+        }
+        if let Err(e) = self.config.save() {
+            eprintln!("Failed to save app config on exit: {}", e);
         }
     }
 }
