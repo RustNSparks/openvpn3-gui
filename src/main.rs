@@ -1,7 +1,5 @@
 // src/main.rs
 use eframe::egui;
-use std::sync::mpsc;
-use tokio::runtime::Runtime;
 
 mod app;
 mod config;

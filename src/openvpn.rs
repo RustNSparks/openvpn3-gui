@@ -1,4 +1,4 @@
-// src/openvpn.rs (Updated with suggestions)
+// src/openvpn.rs (Complete implementation with Error variant)
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
@@ -21,7 +21,7 @@ pub enum ConnectionStatus {
     AuthenticationRequired {
         session_path: String,
         prompt: String,
-    }, // New
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,65 +56,60 @@ pub struct ConfigProfile {
 #[derive(Debug)]
 pub enum VpnMessage {
     StatusUpdate(ConnectionStatus),
-    LogMessage(String), // Can be from manager or streamed from openvpn3 log
-    Error(String),
+    LogMessage(String), // For general logging
+    Error(String),      // For critical errors that need user attention
     SessionsList(Vec<SessionInfo>),
     SessionStats(SessionStats),
     ConfigsList(Vec<ConfigProfile>),
     ConfigImported(String),
-    VpnCliVersion(String), // New
+    VpnCliVersion(String),
     ConfigDumped {
         name: String,
         content: String,
-    }, // New
+    },
     AuthenticationPrompt {
         session_path: String,
         prompt: String,
-    }, // New: Specific prompt for UI
+    },
 }
 
 #[derive(Debug)]
 pub enum VpnCommand {
-    Connect(String), // Config path or name
+    Connect(String),
     Disconnect,
     ListSessions,
-    GetSessionStats, // For current session
+    GetSessionStats,
     ListConfigs,
-    ImportConfig(String, String), // path, name
-    RemoveConfig(String),         // config path or name
+    ImportConfig(String, String),
+    RemoveConfig(String),
     GetStatusUpdate,
     Shutdown,
-
-    // Logging related commands
-    EnableManagerLogBuffer,  // To enable manager's own log messages
-    DisableManagerLogBuffer, // To disable manager's own log messages
-    StartLiveVpnLogs,        // To start streaming `openvpn3 log`
-    StopLiveVpnLogs,         // To stop streaming `openvpn3 log`
-
-    // New commands
+    EnableManagerLogBuffer,
+    DisableManagerLogBuffer,
+    StartLiveVpnLogs,
+    StopLiveVpnLogs,
     GetVpnCliVersion,
-    DumpConfig(String), // Config name or path
+    DumpConfig(String),
     SubmitAuthentication {
         session_path: String,
         response: String,
-    }, // New
+    },
 }
 
 pub struct OpenVPN3Manager {
     status: Arc<Mutex<ConnectionStatus>>,
-    current_session_path: Arc<Mutex<Option<String>>>, // Renamed for clarity
+    current_session_path: Arc<Mutex<Option<String>>>,
     stats: Arc<Mutex<Option<SessionStats>>>,
     sessions: Arc<Mutex<Vec<SessionInfo>>>,
     configs: Arc<Mutex<Vec<ConfigProfile>>>,
-    command_tx: mpsc::Sender<VpnCommand>, // To send commands to the manager's loop
-    message_tx: mpsc::Sender<VpnMessage>, // To send messages/updates to the UI
-    manager_logging_active: Arc<Mutex<bool>>, // Controls if manager sends its own LogMessages
-    live_log_process: Arc<Mutex<Option<Child>>>, // Holds the `openvpn3 log` child process
+    command_tx: mpsc::Sender<VpnCommand>,
+    message_tx: mpsc::Sender<VpnMessage>,
+    manager_logging_active: Arc<Mutex<bool>>,
+    live_log_process: Arc<Mutex<Option<Child>>>,
 }
 
 unsafe impl Send for OpenVPN3Manager {}
 
-// Manual Clone implementation because Child is not Clone
 impl Clone for OpenVPN3Manager {
     fn clone(&self) -> Self {
         Self {
@@ -142,7 +137,7 @@ impl OpenVPN3Manager {
             configs: Arc::new(Mutex::new(vec![])),
             command_tx,
             message_tx,
-            manager_logging_active: Arc::new(Mutex::new(true)), // Manager logging enabled by default
+            manager_logging_active: Arc::new(Mutex::new(true)),
             live_log_process: Arc::new(Mutex::new(None)),
         };
         (manager, command_rx)
@@ -235,67 +230,72 @@ impl OpenVPN3Manager {
         Ok(())
     }
 
-    // --- Getter for current status ---
     pub fn get_status(&self) -> ConnectionStatus {
         self.status.lock().unwrap().clone()
     }
 
     // --- Manager's main loop (runs in a separate tokio task) ---
-    pub async fn run_manager_loop(&self, mut command_rx: mpsc::Receiver<VpnCommand>) {
+    pub async fn run_manager_loop(&self, command_rx: mpsc::Receiver<VpnCommand>) {
         let mut connection_monitoring_active = false;
 
-        // Initial data load
-        let _ = self.handle_list_configs().await;
-        let _ = self.handle_list_sessions().await;
-        let _ = self.handle_get_vpn_cli_version().await; // Get version on startup
+        // Initial data load with error handling
+        if let Err(e) = self.handle_list_configs().await {
+            self.send_error(format!("Failed to load initial configs: {}", e));
+        }
+        if let Err(e) = self.handle_list_sessions().await {
+            self.send_error(format!("Failed to load initial sessions: {}", e));
+        }
+        if let Err(e) = self.handle_get_vpn_cli_version().await {
+            self.send_error(format!("Failed to get OpenVPN3 CLI version: {}", e));
+        }
 
         self.log_manager_message("Manager loop started.".to_string());
 
         loop {
-            // Non-blocking command check
             if let Ok(command) = command_rx.try_recv() {
                 match command {
                     VpnCommand::Connect(config_id) => {
                         if let Err(e) = self.handle_connect(&config_id).await {
-                            self.set_status_and_log_error(e.to_string(), "Connect failed");
+                            self.send_error(format!("Connection failed for '{}': {}", config_id, e));
+                            self.set_status(ConnectionStatus::Error(e.to_string()));
                         } else {
-                            connection_monitoring_active = true; // Start monitoring after connect attempt
+                            connection_monitoring_active = true;
                         }
                     }
                     VpnCommand::Disconnect => {
                         if let Err(e) = self.handle_disconnect().await {
-                            self.set_status_and_log_error(e.to_string(), "Disconnect failed");
+                            self.send_error(format!("Disconnect failed: {}", e));
                         }
-                        connection_monitoring_active = false; // Stop monitoring
+                        connection_monitoring_active = false;
                     }
                     VpnCommand::GetStatusUpdate => {
                         if let Err(e) = self.update_connection_status().await {
-                            self.log_manager_error(e.to_string(), "Status update failed");
+                            self.send_error(format!("Status update failed: {}", e));
                         }
                     }
                     VpnCommand::ListSessions => {
                         if let Err(e) = self.handle_list_sessions().await {
-                            self.log_manager_error(e.to_string(), "List sessions failed");
+                            self.send_error(format!("Failed to list sessions: {}", e));
                         }
                     }
                     VpnCommand::GetSessionStats => {
                         if let Err(e) = self.handle_get_session_stats().await {
-                            self.log_manager_error(e.to_string(), "Get session stats failed");
+                            self.send_error(format!("Failed to get session stats: {}", e));
                         }
                     }
                     VpnCommand::ListConfigs => {
                         if let Err(e) = self.handle_list_configs().await {
-                            self.log_manager_error(e.to_string(), "List configs failed");
+                            self.send_error(format!("Failed to list configs: {}", e));
                         }
                     }
                     VpnCommand::ImportConfig(path, name) => {
                         if let Err(e) = self.handle_import_config(&path, &name).await {
-                            self.log_manager_error(e.to_string(), "Import config failed");
+                            self.send_error(format!("Failed to import config '{}': {}", name, e));
                         }
                     }
                     VpnCommand::RemoveConfig(config_id) => {
                         if let Err(e) = self.handle_remove_config(&config_id).await {
-                            self.log_manager_error(e.to_string(), "Remove config failed");
+                            self.send_error(format!("Failed to remove config '{}': {}", config_id, e));
                         }
                     }
                     VpnCommand::EnableManagerLogBuffer => {
@@ -304,26 +304,25 @@ impl OpenVPN3Manager {
                     }
                     VpnCommand::DisableManagerLogBuffer => {
                         *self.manager_logging_active.lock().unwrap() = false;
-                        // No log message here as it's disabled
                     }
                     VpnCommand::StartLiveVpnLogs => {
                         if let Err(e) = self.handle_start_live_vpn_logs().await {
-                            self.log_manager_error(e.to_string(), "Start live VPN logs failed");
+                            self.send_error(format!("Failed to start live VPN logs: {}", e));
                         }
                     }
                     VpnCommand::StopLiveVpnLogs => {
                         if let Err(e) = self.handle_stop_live_vpn_logs().await {
-                            self.log_manager_error(e.to_string(), "Stop live VPN logs failed");
+                            self.send_error(format!("Failed to stop live VPN logs: {}", e));
                         }
                     }
                     VpnCommand::GetVpnCliVersion => {
                         if let Err(e) = self.handle_get_vpn_cli_version().await {
-                            self.log_manager_error(e.to_string(), "Get VPN CLI version failed");
+                            self.send_error(format!("Failed to get VPN CLI version: {}", e));
                         }
                     }
                     VpnCommand::DumpConfig(config_id) => {
                         if let Err(e) = self.handle_dump_config(&config_id).await {
-                            self.log_manager_error(e.to_string(), "Dump config failed");
+                            self.send_error(format!("Failed to dump config '{}': {}", config_id, e));
                         }
                     }
                     VpnCommand::SubmitAuthentication {
@@ -334,52 +333,76 @@ impl OpenVPN3Manager {
                             .handle_submit_authentication(&session_path, &response)
                             .await
                         {
-                            self.log_manager_error(e.to_string(), "Submit authentication failed");
+                            self.send_error(format!("Authentication failed: {}", e));
                         }
                     }
                     VpnCommand::Shutdown => {
-                        self.log_manager_message(
-                            "Shutdown command received. Stopping live logs and exiting loop."
-                                .to_string(),
-                        );
-                        let _ = self.handle_stop_live_vpn_logs().await; // Ensure logs are stopped
-                        break; // Exit the manager loop
+                        self.log_manager_message("Shutdown command received.".to_string());
+                        let _ = self.handle_stop_live_vpn_logs().await;
+                        break;
                     }
                 }
             }
 
-            // Periodically monitor connection if active
+            // Periodic monitoring with error handling
             if connection_monitoring_active {
                 if let Err(e) = self.update_connection_status().await {
-                    self.log_manager_error(e.to_string(), "Periodic status update failed");
+                    self.log_manager_message(format!("Status update error: {}", e));
                 }
 
-                // Get session stats if connected
                 if matches!(self.get_status(), ConnectionStatus::Connected { .. }) {
                     if let Err(e) = self.handle_get_session_stats().await {
-                        self.log_manager_error(e.to_string(), "Periodic session stats failed");
+                        self.log_manager_message(format!("Stats update error: {}", e));
                     }
                 }
 
-                // If connection dropped or errored, stop intensive monitoring
                 let current_status = self.get_status();
                 if matches!(
                     current_status,
                     ConnectionStatus::Disconnected | ConnectionStatus::Error(_)
                 ) {
                     connection_monitoring_active = false;
-                    self.log_manager_message(
-                        "Connection dropped or errored. Disabling active monitoring.".to_string(),
-                    );
+                    self.log_manager_message("Disabling active monitoring.".to_string());
                 }
             }
-            sleep(Duration::from_secs(2)).await; // Main loop interval
+            sleep(Duration::from_secs(2)).await;
         }
         self.log_manager_message("Manager loop terminated.".to_string());
     }
 
-    // --- Command Handlers (called by run_manager_loop) ---
+    // --- Helper methods for messaging and status ---
+    fn send_error(&self, error_msg: String) {
+        // Send critical errors as Error messages
+        self.send_message_to_ui(VpnMessage::Error(error_msg.clone()));
+        // Also log for debugging if logging is active
+        if *self.manager_logging_active.lock().unwrap() {
+            self.send_message_to_ui(VpnMessage::LogMessage(format!(
+                "[MANAGER ERROR] {}",
+                error_msg
+            )));
+        }
+    }
 
+    fn set_status(&self, new_status: ConnectionStatus) {
+        let mut status_guard = self.status.lock().unwrap();
+        *status_guard = new_status.clone();
+        drop(status_guard);
+        self.send_message_to_ui(VpnMessage::StatusUpdate(new_status));
+    }
+
+    fn log_manager_message(&self, message: String) {
+        if *self.manager_logging_active.lock().unwrap() {
+            self.send_message_to_ui(VpnMessage::LogMessage(format!("[MANAGER] {}", message)));
+        }
+    }
+
+    fn send_message_to_ui(&self, message: VpnMessage) {
+        if let Err(e) = self.message_tx.send(message) {
+            eprintln!("OpenVPN3Manager: Failed to send message to UI: {}", e);
+        }
+    }
+
+    // --- Command Handlers (called by run_manager_loop) ---
     async fn handle_connect(&self, config_identifier: &str) -> Result<()> {
         let current_status = self.get_status();
         if !matches!(
@@ -398,15 +421,11 @@ impl OpenVPN3Manager {
             config_identifier
         ));
 
-        // Determine if config_identifier is a path or a name (heuristic)
-        // OpenVPN3 CLI is flexible: session-start --config <file_path> OR --config-path <dbus_path>
-        // We'll try to intelligently pick one. If it looks like a D-Bus path, use --config-path.
         let mut cmd = TokioCommand::new("openvpn3");
         cmd.arg("session-start");
         if config_identifier.starts_with("/net/openvpn/v3/configuration/") {
             cmd.args(&["--config-path", config_identifier]);
         } else {
-            // Could be a name or a file path. `openvpn3 session-start --config` handles both.
             cmd.args(&["--config", config_identifier]);
         }
 
@@ -414,11 +433,9 @@ impl OpenVPN3Manager {
 
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            // Check for common auth required messages (this is a guess, actual messages may vary)
             if error_msg.to_lowercase().contains("authentication failed")
                 || error_msg.to_lowercase().contains("auth-user-pass")
             {
-                // Try to extract session path if connection was initiated but needs auth
                 let stdout_str = String::from_utf8_lossy(&output.stdout);
                 if let Some(session_path) = self.extract_session_path_from_output(&stdout_str) {
                     self.set_status(ConnectionStatus::AuthenticationRequired {
@@ -428,7 +445,6 @@ impl OpenVPN3Manager {
                             config_identifier, error_msg
                         ),
                     });
-                    // Send a specific prompt message to UI
                     self.send_message_to_ui(VpnMessage::AuthenticationPrompt {
                         session_path,
                         prompt: format!(
@@ -436,7 +452,7 @@ impl OpenVPN3Manager {
                             config_identifier, error_msg
                         ),
                     });
-                    return Ok(()); // Not an error, but requires user action
+                    return Ok(());
                 }
             }
             self.set_status(ConnectionStatus::Error(error_msg.clone()));
@@ -452,12 +468,10 @@ impl OpenVPN3Manager {
                 "Session started successfully. Path: {}",
                 session_path
             ));
-            // Status will be updated to Connected by the monitor
         } else {
-            // It's possible session started but path wasn't parsed, or it's an unexpected success message
             self.log_manager_message("Session start reported success, but session path not found in output. Will rely on status updates.".to_string());
         }
-        // Trigger an immediate status update
+        
         self.update_connection_status().await?;
         Ok(())
     }
@@ -489,9 +503,7 @@ impl OpenVPN3Manager {
 
             if !output.status.success() {
                 let error = String::from_utf8_lossy(&output.stderr).to_string();
-                // Don't set to Error status here, as Disconnected is the goal. Log the error.
-                self.log_manager_error(error.clone(), "Disconnect command failed");
-                // Fall through to set Disconnected, but the error is logged.
+                self.log_manager_message(format!("Disconnect command failed: {}", error));
             } else {
                 self.log_manager_message("Disconnect command successful.".to_string());
             }
@@ -501,7 +513,6 @@ impl OpenVPN3Manager {
             );
         }
 
-        // Reset state regardless of command success, as the intent is to be disconnected.
         *self.current_session_path.lock().unwrap() = None;
         *self.stats.lock().unwrap() = None;
         self.set_status(ConnectionStatus::Disconnected);
@@ -512,15 +523,13 @@ impl OpenVPN3Manager {
         let session_path_opt = self.current_session_path.lock().unwrap().clone();
 
         if let Some(session_path) = session_path_opt {
-            // Fetch full session details which might indicate status
             let output = TokioCommand::new("openvpn3")
-                .args(&["session-stats", "--session-path", &session_path]) // session-stats often has status info
+                .args(&["session-stats", "--session-path", &session_path])
                 .output()
                 .await?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // If session path is invalid (e.g., session ended abruptly), it's effectively disconnected
                 if stderr.contains("Invalid session path") || stderr.contains("not found") {
                     self.log_manager_message(format!(
                         "Session {} no longer valid. Marking as Disconnected.",
@@ -540,7 +549,6 @@ impl OpenVPN3Manager {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let new_status = self.parse_status_from_session_output(&output_str, &session_path);
 
-            // If status indicates auth is needed and we weren't already in that state
             if let ConnectionStatus::AuthenticationRequired { .. } = new_status {
                 if !matches!(
                     self.get_status(),
@@ -562,7 +570,6 @@ impl OpenVPN3Manager {
                 self.set_status(new_status);
             }
         } else {
-            // No current session, ensure status is Disconnected if not already Error
             let current_internal_status = self.get_status();
             if !matches!(
                 current_internal_status,
@@ -579,9 +586,6 @@ impl OpenVPN3Manager {
         output_str: &str,
         session_path: &str,
     ) -> ConnectionStatus {
-        // This parsing needs to be robust and based on actual `openvpn3 session-stats` output
-        // or `openvpn3 sessions-list` for the specific session.
-        // For now, a simplified version:
         if output_str.to_lowercase().contains("status: connected")
             || output_str.to_lowercase().contains("connection initiated")
         {
@@ -598,7 +602,6 @@ impl OpenVPN3Manager {
         } else if output_str.to_lowercase().contains("status: authenticating")
             || output_str.to_lowercase().contains("auth_pending")
         {
-            // This is a guess for auth pending
             ConnectionStatus::AuthenticationRequired {
                 session_path: session_path.to_string(),
                 prompt: "Authentication is pending. Please provide credentials.".to_string(),
@@ -608,14 +611,11 @@ impl OpenVPN3Manager {
         {
             ConnectionStatus::Disconnected
         } else {
-            // If status is unclear from stats, it might be an intermediate state or an issue.
-            // Defaulting to connecting if session path exists but status is not clear.
-            // A better approach would be to also check `sessions-list`.
             self.log_manager_message(format!(
                 "Could not determine clear status from session output for {}. Output: {}",
                 session_path, output_str
             ));
-            ConnectionStatus::Connecting // Or Error, depending on how strict you want to be
+            ConnectionStatus::Connecting
         }
     }
 
@@ -665,8 +665,7 @@ impl OpenVPN3Manager {
             }
         } else {
             self.log_manager_message("Get session stats called but no active session.".to_string());
-            *self.stats.lock().unwrap() = None; // Clear stats if no session
-                                                // Optionally send an empty stats message or a specific "no active session" message
+            *self.stats.lock().unwrap() = None;
         }
         Ok(())
     }
@@ -698,7 +697,7 @@ impl OpenVPN3Manager {
                 "--name",
                 name,
                 "--persistent",
-            ]) // Added --persistent
+            ])
             .output()
             .await?;
 
@@ -712,15 +711,11 @@ impl OpenVPN3Manager {
         let output_str = String::from_utf8_lossy(&output.stdout).to_string();
         self.send_message_to_ui(VpnMessage::ConfigImported(output_str.clone()));
         self.log_manager_message(format!("Config imported: {}", output_str));
-        self.handle_list_configs().await?; // Refresh list
+        self.handle_list_configs().await?;
         Ok(())
     }
 
     async fn handle_remove_config(&self, config_identifier: &str) -> Result<()> {
-        // `config-remove` can take `--path <dbus_path>` or `--name <name>`
-        // We need to determine which one to use or try to be robust.
-        // For simplicity, assuming identifier might be a name first, then try path if it looks like one.
-        // A more robust way would be to always list configs and find the D-Bus path for a given name.
         let mut cmd = TokioCommand::new("openvpn3");
         cmd.arg("config-remove");
         if config_identifier.starts_with("/net/openvpn/v3/configuration/") {
@@ -739,12 +734,11 @@ impl OpenVPN3Manager {
             ));
         }
         self.log_manager_message(format!("Config removed: {}", config_identifier));
-        self.handle_list_configs().await?; // Refresh list
+        self.handle_list_configs().await?;
         Ok(())
     }
 
     async fn handle_start_live_vpn_logs(&self) -> Result<()> {
-        // Ensure any previous log process is stopped
         self.handle_stop_live_vpn_logs().await?;
 
         self.log_manager_message("Starting live VPN log streaming...".to_string());
@@ -763,11 +757,10 @@ impl OpenVPN3Manager {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture stderr from 'openvpn3 log'"))?;
 
-        // Store the process and drop the guard immediately
         {
             let mut guard = self.live_log_process.lock().unwrap();
             *guard = Some(cmd_process);
-        } // Mutex guard is dropped here
+        }
 
         let message_tx_stdout = self.message_tx.clone();
         tokio::spawn(async move {
@@ -795,11 +788,10 @@ impl OpenVPN3Manager {
     }
 
     async fn handle_stop_live_vpn_logs(&self) -> Result<()> {
-        // Extract the child process and drop the mutex guard immediately
         let child_opt = {
             let mut guard = self.live_log_process.lock().unwrap();
             guard.take()
-        }; // Mutex guard is dropped here
+        };
 
         if let Some(mut child) = child_opt {
             self.log_manager_message("Stopping live VPN log streaming...".to_string());
@@ -846,7 +838,6 @@ impl OpenVPN3Manager {
             ));
         }
         let content = String::from_utf8_lossy(&output.stdout).to_string();
-        // Try to find the name if identifier was a path, or use identifier if it was a name
         let name = if config_identifier.starts_with("/net/openvpn/v3/configuration/") {
             self.configs
                 .lock()
@@ -868,8 +859,6 @@ impl OpenVPN3Manager {
             session_path
         ));
 
-        // Use session-manage with --password-prompt or stdin approach
-        // This is more likely to be the correct OpenVPN3 command pattern
         let mut child = TokioCommand::new("openvpn3")
             .args(&[
                 "session-manage",
@@ -882,7 +871,6 @@ impl OpenVPN3Manager {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        // Write the response to stdin
         if let Some(stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             let mut stdin = stdin;
@@ -916,10 +904,8 @@ impl OpenVPN3Manager {
         Ok(())
     }
 
-    // --- Parsing Helpers --- (These are simplified and might need more robust error handling)
+    // --- Parsing Helpers ---
     fn parse_sessions_list(&self, output: &str) -> Vec<SessionInfo> {
-        // This parser assumes a specific block structure for each session.
-        // It should be made more robust, e.g., by looking for "Session path:" to start a new session.
         let mut sessions = Vec::new();
         let mut current_session: Option<SessionInfo> = None;
 
@@ -948,7 +934,6 @@ impl OpenVPN3Manager {
             }
         }
         if let Some(session) = current_session.take() {
-            // Add the last session
             sessions.push(session);
         }
         sessions
@@ -968,7 +953,7 @@ impl OpenVPN3Manager {
                     name: String::new(),
                     import_time: String::new(),
                     owner: String::new(),
-                    valid: true, // Assume valid if listed
+                    valid: true,
                 });
             } else if let Some(config) = current_config.as_mut() {
                 if line.starts_with("Configuration name:") {
@@ -977,13 +962,10 @@ impl OpenVPN3Manager {
                     config.import_time = self.extract_value(line, "Imported:");
                 } else if line.starts_with("Owner:") {
                     config.owner = self.extract_value(line, "Owner:");
-                } else if line.starts_with("Last Used:") { // Example of another field
-                     // config.last_used = self.extract_value(line, "Last Used:");
                 }
             }
         }
         if let Some(config) = current_config.take() {
-            // Add the last config
             configs.push(config);
         }
         configs
@@ -996,7 +978,6 @@ impl OpenVPN3Manager {
     }
 
     fn parse_session_stats(&self, output: &str) -> Option<SessionStats> {
-        // This parser is very basic. A more robust solution would use regex or more detailed line checking.
         let mut stats = SessionStats {
             bytes_in: 0,
             bytes_out: 0,
@@ -1046,45 +1027,7 @@ impl OpenVPN3Manager {
             .map(|s| s.trim().to_string())
     }
 
-    // --- Internal State Management & Messaging ---
-    fn set_status(&self, new_status: ConnectionStatus) {
-        let mut status_guard = self.status.lock().unwrap();
-        *status_guard = new_status.clone();
-        // Drop the guard before sending message to avoid potential deadlock if UI thread calls back immediately
-        drop(status_guard);
-        self.send_message_to_ui(VpnMessage::StatusUpdate(new_status));
-    }
-
-    fn set_status_and_log_error(&self, error_msg: String, context: &str) {
-        self.log_manager_message(format!("Error ({}): {}", context, error_msg));
-        self.set_status(ConnectionStatus::Error(error_msg)); // This sends StatusUpdate
-    }
-
-    fn log_manager_message(&self, message: String) {
-        if *self.manager_logging_active.lock().unwrap() {
-            self.send_message_to_ui(VpnMessage::LogMessage(format!("[MANAGER] {}", message)));
-        }
-    }
-
-    fn log_manager_error(&self, error_msg: String, context: &str) {
-        // Manager errors are always sent to UI log, regardless of manager_logging_active
-        self.send_message_to_ui(VpnMessage::LogMessage(format!(
-            "[MANAGER ERROR] {}: {}",
-            context, error_msg
-        )));
-        // We don't set global status to Error here unless it's a connection-fatal error.
-        // The specific handler should decide if global status changes.
-    }
-
-    fn send_message_to_ui(&self, message: VpnMessage) {
-        if let Err(e) = self.message_tx.send(message) {
-            // If UI channel is broken, manager can't do much. Log to its own console.
-            eprintln!("OpenVPN3Manager: Failed to send message to UI: {}", e);
-        }
-    }
-
     fn status_changed(&self, old: &ConnectionStatus, new: &ConnectionStatus) -> bool {
-        // Compare relevant fields, not just discriminant, for more accurate change detection
         match (old, new) {
             (
                 ConnectionStatus::Connected {
@@ -1107,7 +1050,7 @@ impl OpenVPN3Manager {
                     prompt: n_pr,
                 },
             ) => o_p != n_p || o_pr != n_pr,
-            _ => std::mem::discriminant(old) != std::mem::discriminant(new), // Fallback to discriminant for other types
+            _ => std::mem::discriminant(old) != std::mem::discriminant(new),
         }
     }
 }
