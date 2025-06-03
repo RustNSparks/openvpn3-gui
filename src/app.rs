@@ -334,10 +334,8 @@ impl OpenVPN3App {
         if matches!(
             self.connection_status,
             ConnectionStatus::AuthenticationRequired { .. }
-        ) {
-            if ui.button("Enter Credentials").clicked() {
-                self.show_auth_dialog = true;
-            }
+        ) && ui.button("Enter Credentials").clicked() {
+            self.show_auth_dialog = true;
         }
 
         ui.separator();
@@ -480,7 +478,7 @@ impl OpenVPN3App {
             });
 
             if let Some(config_path_to_remove) = action_remove {
-                let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                let manager = self.vpn_manager.clone();
                 if let Some(manager) = manager {
                     self.add_log_entry(format!(
                         "Requesting removal of config: {}",
@@ -490,7 +488,7 @@ impl OpenVPN3App {
                 }
             }
             if let Some(config_path_to_dump) = action_dump {
-                let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                let manager = self.vpn_manager.clone();
                 if let Some(manager) = manager {
                     self.add_log_entry(format!(
                         "Requesting dump of config: {}",
@@ -786,7 +784,7 @@ impl OpenVPN3App {
                     if text_edit_response.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter))
                     {
-                        let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                        let manager = self.vpn_manager.clone();
                         let session_path = self.auth_session_path.clone();
                         if let (Some(manager), Some(session_path)) = (manager, session_path) {
                             let _ = manager.submit_authentication(
@@ -801,7 +799,7 @@ impl OpenVPN3App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("Submit").clicked() {
-                            let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+                            let manager = self.vpn_manager.clone();
                             let session_path = self.auth_session_path.clone();
                             if let (Some(manager), Some(session_path)) = (manager, session_path) {
                                 let _ = manager.submit_authentication(
@@ -872,7 +870,7 @@ impl OpenVPN3App {
 
     fn connect_vpn(&mut self, config_identifier: &str) {
         self.ensure_manager_started();
-        let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+        let manager = self.vpn_manager.clone();
         if let Some(manager) = manager {
             self.add_log_entry(format!(
                 "Sending connect command for: {}",
@@ -885,7 +883,7 @@ impl OpenVPN3App {
     }
 
     fn disconnect_vpn(&mut self) {
-        let manager = self.vpn_manager.as_ref().map(|m| m.clone());
+        let manager = self.vpn_manager.clone();
         if let Some(manager) = manager {
             self.add_log_entry("Sending disconnect command.".to_string());
             if let Err(e) = manager.disconnect() {

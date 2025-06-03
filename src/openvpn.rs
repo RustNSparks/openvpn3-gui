@@ -433,9 +433,9 @@ impl OpenVPN3Manager {
         let mut cmd = TokioCommand::new("openvpn3");
         cmd.arg("session-start");
         if config_identifier.starts_with("/net/openvpn/v3/configuration/") {
-            cmd.args(&["--config-path", config_identifier]);
+            cmd.args(["--config-path", config_identifier]);
         } else {
-            cmd.args(&["--config", config_identifier]);
+            cmd.args(["--config", config_identifier]);
         }
 
         let output = cmd.output().await?;
@@ -501,7 +501,7 @@ impl OpenVPN3Manager {
             self.log_manager_message(format!("Disconnecting session: {}", session_path));
 
             let output = TokioCommand::new("openvpn3")
-                .args(&[
+                .args([
                     "session-manage",
                     "--session-path",
                     &session_path,
@@ -533,7 +533,7 @@ impl OpenVPN3Manager {
 
         if let Some(session_path) = session_path_opt {
             let output = TokioCommand::new("openvpn3")
-                .args(&["session-stats", "--session-path", &session_path])
+                .args(["session-stats", "--session-path", &session_path])
                 .output()
                 .await?;
 
@@ -650,7 +650,7 @@ impl OpenVPN3Manager {
         let session_path_opt = self.current_session_path.lock().unwrap().clone();
         if let Some(session_path) = session_path_opt {
             let output = TokioCommand::new("openvpn3")
-                .args(&["session-stats", "--session-path", &session_path])
+                .args(["session-stats", "--session-path", &session_path])
                 .output()
                 .await?;
 
@@ -699,7 +699,7 @@ impl OpenVPN3Manager {
 
     async fn handle_import_config(&self, file_path: &str, name: &str) -> Result<()> {
         let output = TokioCommand::new("openvpn3")
-            .args(&[
+            .args([
                 "config-import",
                 "--config",
                 file_path,
@@ -869,7 +869,7 @@ impl OpenVPN3Manager {
         ));
 
         let mut child = TokioCommand::new("openvpn3")
-            .args(&[
+            .args([
                 "session-manage",
                 "--session-path",
                 session_path,
