@@ -2,7 +2,7 @@
 
 A modern, user-friendly graphical interface for OpenVPN3 Linux client built with Rust and egui.
 
-[![Build Status](https://github.com/RustNSparks/openvpn3-gui/workflows/Build%20and%20Release/badge.svg)](https://github.com/yourusername/openvpn3-gui/actions)
+[![Build Status](https://github.com/RustNSparks/openvpn3-gui/workflows/Build%20and%20Release/badge.svg)](https://github.com/RustNSparks/openvpn3-gui/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Latest Release](https://img.shields.io/github/v/release/RustNSparks/openvpn3-gui)](https://github.com/RustNSparks/openvpn3-gui/releases/latest)
 
@@ -178,7 +178,7 @@ source ~/.cargo/env
 ### Build and Run
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/openvpn3-gui.git
+git clone https://github.com/RustNSparks/openvpn3-gui.git
 cd openvpn3-gui
 
 # Build in release mode

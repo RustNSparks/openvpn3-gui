@@ -19,11 +19,8 @@ jobs:
     - uses: actions/checkout@v4
     
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
-        profile: minimal
-        toolchain: stable
-        override: true
         components: rustfmt, clippy
     
     - name: Install system dependencies
@@ -43,19 +40,19 @@ jobs:
           libcairo2-dev
     
     - name: Cache cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Cache cargo index
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Cache cargo build
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -83,12 +80,9 @@ jobs:
     - uses: actions/checkout@v4
     
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
-        profile: minimal
-        toolchain: stable
-        target: ${{ matrix.target }}
-        override: true
+        targets: ${{ matrix.target }}
     
     - name: Install system dependencies
       run: |
@@ -114,19 +108,19 @@ jobs:
         echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
     
     - name: Cache cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Cache cargo index
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-${{ matrix.target }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Cache cargo build
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: target
         key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -159,7 +153,7 @@ jobs:
         fi
     
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: linux-binaries-${{ matrix.target }}
         path: |
@@ -175,11 +169,7 @@ jobs:
     - uses: actions/checkout@v4
     
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      uses: dtolnay/rust-toolchain@stable
     
     - name: Install system dependencies
       run: |
@@ -263,7 +253,7 @@ jobs:
       run: sha256sum openvpn3-gui-x86_64.AppImage > openvpn3-gui-x86_64.AppImage.sha256
     
     - name: Upload AppImage artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: appimage
         path: |
@@ -280,10 +270,14 @@ jobs:
     - uses: actions/checkout@v4
     
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
     
     - name: Display structure of downloaded files
-      run: ls -la
+      run: |
+        echo "Current directory contents:"
+        ls -la
+        echo "Looking for artifacts..."
+        find . -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.sha256" | head -20
     
     - name: Create release notes
       run: |
@@ -312,13 +306,16 @@ jobs:
         EOF
     
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         body_path: release-notes.md
         files: |
-          linux-binaries-x86_64-unknown-linux-gnu/*
-          linux-binaries-x86_64-unknown-linux-musl/*
-          appimage/*
+          linux-binaries-x86_64-unknown-linux-gnu/*.tar.gz
+          linux-binaries-x86_64-unknown-linux-gnu/*.sha256
+          linux-binaries-x86_64-unknown-linux-musl/*.tar.gz
+          linux-binaries-x86_64-unknown-linux-musl/*.sha256
+          appimage/*.AppImage
+          appimage/*.sha256
         draft: false
         prerelease: false
       env:
@@ -332,10 +329,10 @@ jobs:
     
     steps:
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
     
     - name: Create development release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: "development-latest"
         name: "Development Build (Latest)"
@@ -352,10 +349,14 @@ jobs:
           **Commit**: ${{ github.sha }}
           **Build Date**: ${{ github.run_id }}
         files: |
-          linux-binaries-x86_64-unknown-linux-gnu/*
-          linux-binaries-x86_64-unknown-linux-musl/*
-          appimage/*
+          linux-binaries-x86_64-unknown-linux-gnu/*.tar.gz
+          linux-binaries-x86_64-unknown-linux-gnu/*.sha256
+          linux-binaries-x86_64-unknown-linux-musl/*.tar.gz
+          linux-binaries-x86_64-unknown-linux-musl/*.sha256
+          appimage/*.AppImage
+          appimage/*.sha256
         draft: false
         prerelease: true
+        make_latest: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
