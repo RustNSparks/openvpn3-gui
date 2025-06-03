@@ -163,7 +163,7 @@ jobs:
   create-appimage:
     name: Create AppImage
     needs: test
-    runs-on: ubuntu-20.04  # Use older Ubuntu for better compatibility
+    runs-on: ubuntu-24.04  # Use older Ubuntu for better compatibility
     
     steps:
     - uses: actions/checkout@v4
