@@ -2,9 +2,9 @@
 
 A modern, user-friendly graphical interface for OpenVPN3 Linux client built with Rust and egui.
 
-[![Build Status](https://github.com/yourusername/openvpn3-gui/workflows/Build%20and%20Release/badge.svg)](https://github.com/yourusername/openvpn3-gui/actions)
+[![Build Status](https://github.com/RustNSparks/openvpn3-gui/workflows/Build%20and%20Release/badge.svg)](https://github.com/yourusername/openvpn3-gui/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Latest Release](https://img.shields.io/github/v/release/yourusername/openvpn3-gui)](https://github.com/yourusername/openvpn3-gui/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/RustNSparks/openvpn3-gui)](https://github.com/RustNSparks/openvpn3-gui/releases/latest)
 
 ## 🚀 Features
 
@@ -58,7 +58,7 @@ openvpn3 version
 ### Option 1: AppImage (Recommended)
 The easiest way to run OpenVPN3 GUI on any Linux distribution:
 
-1. Download the latest AppImage from [Releases](https://github.com/yourusername/openvpn3-gui/releases/latest)
+1. Download the latest AppImage from [Releases](https://github.com/RustNSparks/openvpn3-gui/releases/latest)
 2. Make it executable and run:
    ```bash
    chmod +x openvpn3-gui-x86_64.AppImage
@@ -277,7 +277,7 @@ RUST_LOG=debug ./openvpn3-gui
 ```
 
 ### Getting Help
-1. Check the [Issues](https://github.com/yourusername/openvpn3-gui/issues) page
+1. Check the [Issues](https://github.com/RustNSparks/openvpn3-gui/issues) page
 2. Review OpenVPN3 Linux documentation
 3. Enable debug logging and include logs when reporting issues
 
