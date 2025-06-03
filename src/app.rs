@@ -1,8 +1,7 @@
 // src/app.rs (Complete implementation with Error handling)
 use crate::config::AppConfig;
 use crate::openvpn::{
-    ConfigProfile, ConnectionStatus, OpenVPN3Manager, SessionInfo, SessionStats,
-    VpnMessage,
+    ConfigProfile, ConnectionStatus, OpenVPN3Manager, SessionInfo, SessionStats, VpnMessage,
 };
 use eframe::egui;
 use std::sync::mpsc;
@@ -157,7 +156,7 @@ impl OpenVPN3App {
     fn add_error_entry(&mut self, error_message: String) {
         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
         let formatted_error = format!("[{}] 🔴 CRITICAL ERROR: {}", timestamp, error_message);
-        
+
         // Add to logs
         self.log_messages.push(formatted_error.clone());
         if self.log_messages.len() > 1000 {
@@ -171,9 +170,10 @@ impl OpenVPN3App {
         }
 
         // Show error dialog for critical errors
-        if error_message.contains("Connection failed") 
+        if error_message.contains("Connection failed")
             || error_message.contains("Authentication failed")
-            || error_message.contains("Failed to load initial") {
+            || error_message.contains("Failed to load initial")
+        {
             self.current_error_message = error_message;
             self.show_error_dialog = true;
         }
@@ -263,8 +263,6 @@ impl OpenVPN3App {
         ui.separator();
     }
 
-
-
     fn draw_connection_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Connection Management");
 
@@ -276,18 +274,21 @@ impl OpenVPN3App {
         if !self.recent_errors.is_empty() {
             ui.group(|ui| {
                 ui.colored_label(egui::Color32::RED, "⚠️ Recent Critical Errors:");
-                
+
                 for error in self.recent_errors.iter().rev().take(3) {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }
-                
+
                 if self.recent_errors.len() > 3 {
                     ui.colored_label(
-                        egui::Color32::GRAY, 
-                        format!("... and {} more errors (check Logs tab)", self.recent_errors.len() - 3)
+                        egui::Color32::GRAY,
+                        format!(
+                            "... and {} more errors (check Logs tab)",
+                            self.recent_errors.len() - 3
+                        ),
                     );
                 }
-                
+
                 ui.horizontal(|ui| {
                     if ui.button("Clear Errors").clicked() {
                         clear_errors = true;
@@ -596,7 +597,13 @@ impl OpenVPN3App {
         // Show error summary if there are recent errors
         if !self.recent_errors.is_empty() {
             ui.group(|ui| {
-                ui.colored_label(egui::Color32::RED, format!("⚠️ {} Critical Errors in Session:", self.recent_errors.len()));
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!(
+                        "⚠️ {} Critical Errors in Session:",
+                        self.recent_errors.len()
+                    ),
+                );
                 egui::ScrollArea::vertical()
                     .max_height(100.0)
                     .show(ui, |ui| {
@@ -663,7 +670,10 @@ impl OpenVPN3App {
         ui.separator();
         ui.group(|ui| {
             ui.label("Error Handling:");
-            ui.label(format!("Recent errors tracked: {}", self.recent_errors.len()));
+            ui.label(format!(
+                "Recent errors tracked: {}",
+                self.recent_errors.len()
+            ));
             if ui.button("Clear All Error History").clicked() {
                 self.recent_errors.clear();
                 self.add_log_entry("Error history cleared.".to_string());
@@ -826,13 +836,13 @@ impl OpenVPN3App {
                 .show(ctx, |ui| {
                     ui.colored_label(egui::Color32::RED, "A critical error has occurred:");
                     ui.add_space(10.0);
-                    
+
                     egui::ScrollArea::vertical()
                         .max_height(150.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new(&self.current_error_message).strong());
                         });
-                    
+
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -848,7 +858,8 @@ impl OpenVPN3App {
                             self.show_error_dialog = false;
                             self.current_error_message.clear();
                             if let Some(idx) = self.selected_config_idx {
-                                let config_name = self.configs_list.get(idx).map(|c| c.name.clone());
+                                let config_name =
+                                    self.configs_list.get(idx).map(|c| c.name.clone());
                                 if let Some(name) = config_name {
                                     self.connect_vpn(&name);
                                 }

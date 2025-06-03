@@ -256,7 +256,10 @@ impl OpenVPN3Manager {
                 match command {
                     VpnCommand::Connect(config_id) => {
                         if let Err(e) = self.handle_connect(&config_id).await {
-                            self.send_error(format!("Connection failed for '{}': {}", config_id, e));
+                            self.send_error(format!(
+                                "Connection failed for '{}': {}",
+                                config_id, e
+                            ));
                             self.set_status(ConnectionStatus::Error(e.to_string()));
                         } else {
                             connection_monitoring_active = true;
@@ -295,7 +298,10 @@ impl OpenVPN3Manager {
                     }
                     VpnCommand::RemoveConfig(config_id) => {
                         if let Err(e) = self.handle_remove_config(&config_id).await {
-                            self.send_error(format!("Failed to remove config '{}': {}", config_id, e));
+                            self.send_error(format!(
+                                "Failed to remove config '{}': {}",
+                                config_id, e
+                            ));
                         }
                     }
                     VpnCommand::EnableManagerLogBuffer => {
@@ -322,7 +328,10 @@ impl OpenVPN3Manager {
                     }
                     VpnCommand::DumpConfig(config_id) => {
                         if let Err(e) = self.handle_dump_config(&config_id).await {
-                            self.send_error(format!("Failed to dump config '{}': {}", config_id, e));
+                            self.send_error(format!(
+                                "Failed to dump config '{}': {}",
+                                config_id, e
+                            ));
                         }
                     }
                     VpnCommand::SubmitAuthentication {
@@ -471,7 +480,7 @@ impl OpenVPN3Manager {
         } else {
             self.log_manager_message("Session start reported success, but session path not found in output. Will rely on status updates.".to_string());
         }
-        
+
         self.update_connection_status().await?;
         Ok(())
     }
