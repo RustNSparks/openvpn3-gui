@@ -1,12 +1,12 @@
 // src/openvpn.rs (Complete implementation with Error variant)
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionStatus {
@@ -1022,11 +1022,7 @@ impl OpenVPN3Manager {
                 found_any = true;
             }
         }
-        if found_any {
-            Some(stats)
-        } else {
-            None
-        }
+        if found_any { Some(stats) } else { None }
     }
 
     fn extract_field(&self, text: &str, field_key: &str) -> Option<String> {
