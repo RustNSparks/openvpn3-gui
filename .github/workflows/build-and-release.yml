@@ -1,0 +1,361 @@
+# .github/workflows/build-and-release.yml
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libxcb-render0-dev \
+          libxcb-shape0-dev \
+          libxcb-xfixes0-dev \
+          libxkbcommon-dev \
+          libssl-dev \
+          libgtk-3-dev \
+          libatk1.0-dev \
+          libgdk-pixbuf2.0-dev \
+          libpango1.0-dev \
+          libcairo2-dev
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v3
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Check formatting
+      run: cargo fmt -- --check
+    
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+    
+    - name: Run tests
+      run: cargo test --verbose
+
+  build-linux:
+    name: Build Linux binaries
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        target: ${{ matrix.target }}
+        override: true
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libxcb-render0-dev \
+          libxcb-shape0-dev \
+          libxcb-xfixes0-dev \
+          libxkbcommon-dev \
+          libssl-dev \
+          libgtk-3-dev \
+          libatk1.0-dev \
+          libgdk-pixbuf2.0-dev \
+          libpango1.0-dev \
+          libcairo2-dev
+    
+    - name: Install musl tools (for musl target)
+      if: matrix.target == 'x86_64-unknown-linux-musl'
+      run: |
+        sudo apt-get install -y musl-tools musl-dev
+        # Set up environment for static linking with musl
+        echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-${{ matrix.target }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v3
+      with:
+        path: target
+        key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Build release binary
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+    
+    - name: Strip binary (for glibc target)
+      if: matrix.target == 'x86_64-unknown-linux-gnu'
+      run: |
+        strip target/${{ matrix.target }}/release/openvpn3-gui
+    
+    - name: Create archive
+      run: |
+        cd target/${{ matrix.target }}/release
+        if [[ "${{ matrix.target }}" == *"musl"* ]]; then
+          tar czf ../../../openvpn3-gui-${{ matrix.target }}-static.tar.gz openvpn3-gui
+        else
+          tar czf ../../../openvpn3-gui-${{ matrix.target }}.tar.gz openvpn3-gui
+        fi
+        cd ../../..
+    
+    - name: Calculate SHA256
+      run: |
+        if [[ "${{ matrix.target }}" == *"musl"* ]]; then
+          sha256sum openvpn3-gui-${{ matrix.target }}-static.tar.gz > openvpn3-gui-${{ matrix.target }}-static.tar.gz.sha256
+        else
+          sha256sum openvpn3-gui-${{ matrix.target }}.tar.gz > openvpn3-gui-${{ matrix.target }}.tar.gz.sha256
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: linux-binaries-${{ matrix.target }}
+        path: |
+          *.tar.gz
+          *.tar.gz.sha256
+
+  create-appimage:
+    name: Create AppImage
+    needs: test
+    runs-on: ubuntu-20.04  # Use older Ubuntu for better compatibility
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libxcb-render0-dev \
+          libxcb-shape0-dev \
+          libxcb-xfixes0-dev \
+          libxkbcommon-dev \
+          libssl-dev \
+          libgtk-3-dev \
+          libatk1.0-dev \
+          libgdk-pixbuf2.0-dev \
+          libpango1.0-dev \
+          libcairo2-dev \
+          wget \
+          fuse
+    
+    - name: Build release binary
+      run: cargo build --release
+    
+    - name: Strip binary
+      run: strip target/release/openvpn3-gui
+    
+    - name: Create AppDir structure
+      run: |
+        mkdir -p AppDir/usr/bin
+        mkdir -p AppDir/usr/share/applications
+        mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+        
+        # Copy binary
+        cp target/release/openvpn3-gui AppDir/usr/bin/
+        
+        # Create desktop file
+        cat > AppDir/usr/share/applications/openvpn3-gui.desktop << 'EOF'
+        [Desktop Entry]
+        Type=Application
+        Name=OpenVPN3 GUI
+        Comment=Graphical user interface for OpenVPN3
+        Exec=openvpn3-gui
+        Icon=openvpn3-gui
+        Categories=Network;Security;
+        Terminal=false
+        EOF
+        
+        # Create a simple icon (you might want to add a real icon later)
+        cat > AppDir/usr/share/icons/hicolor/256x256/apps/openvpn3-gui.svg << 'EOF'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+          <rect width="256" height="256" fill="#0066cc" rx="32"/>
+          <text x="128" y="140" font-family="Arial, sans-serif" font-size="48" fill="white" text-anchor="middle">VPN</text>
+        </svg>
+        EOF
+        
+        # Create AppRun script
+        cat > AppDir/AppRun << 'EOF'
+        #!/bin/bash
+        HERE="$(dirname "$(readlink -f "${0}")")"
+        exec "${HERE}/usr/bin/openvpn3-gui" "$@"
+        EOF
+        chmod +x AppDir/AppRun
+        
+        # Copy desktop file to root
+        cp AppDir/usr/share/applications/openvpn3-gui.desktop AppDir/
+        
+        # Copy icon to root
+        cp AppDir/usr/share/icons/hicolor/256x256/apps/openvpn3-gui.svg AppDir/
+    
+    - name: Download linuxdeploy and AppImage plugin
+      run: |
+        wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+        chmod +x linuxdeploy-x86_64.AppImage
+    
+    - name: Create AppImage
+      run: |
+        ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
+        mv OpenVPN3_GUI-*.AppImage openvpn3-gui-x86_64.AppImage
+    
+    - name: Calculate SHA256 for AppImage
+      run: sha256sum openvpn3-gui-x86_64.AppImage > openvpn3-gui-x86_64.AppImage.sha256
+    
+    - name: Upload AppImage artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: appimage
+        path: |
+          openvpn3-gui-x86_64.AppImage
+          openvpn3-gui-x86_64.AppImage.sha256
+
+  release:
+    name: Create Release
+    needs: [build-linux, create-appimage]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+    
+    - name: Display structure of downloaded files
+      run: ls -la
+    
+    - name: Create release notes
+      run: |
+        cat > release-notes.md << 'EOF'
+        ## OpenVPN3 GUI Release ${{ github.ref_name }}
+        
+        ### Installation Options
+        
+        #### AppImage (Recommended)
+        - **openvpn3-gui-x86_64.AppImage** - Self-contained executable that runs on most Linux distributions
+        - Download, make executable (`chmod +x openvpn3-gui-x86_64.AppImage`), and run
+        
+        #### Traditional Binaries
+        - **openvpn3-gui-x86_64-unknown-linux-gnu.tar.gz** - Standard Linux binary (requires system libraries)
+        - **openvpn3-gui-x86_64-unknown-linux-musl-static.tar.gz** - Statically linked binary (minimal dependencies)
+        
+        ### Prerequisites
+        - OpenVPN3 Linux client must be installed and configured
+        - For GUI functionality, a desktop environment is required
+        
+        ### Checksums
+        SHA256 checksums are provided for all binaries to verify integrity.
+        
+        ### Changes
+        See commit history for detailed changes since the last release.
+        EOF
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        body_path: release-notes.md
+        files: |
+          linux-binaries-x86_64-unknown-linux-gnu/*
+          linux-binaries-x86_64-unknown-linux-musl/*
+          appimage/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  development-build:
+    name: Development Build
+    needs: [build-linux, create-appimage]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+    
+    - name: Create development release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: "development-latest"
+        name: "Development Build (Latest)"
+        body: |
+          ## Development Build - Latest Commit
+          
+          This is an automated build from the latest commit on the main branch.
+          
+          **⚠️ Warning**: Development builds are not thoroughly tested and may contain bugs.
+          
+          ### Installation
+          Same as release versions - see installation instructions in the latest stable release.
+          
+          **Commit**: ${{ github.sha }}
+          **Build Date**: ${{ github.run_id }}
+        files: |
+          linux-binaries-x86_64-unknown-linux-gnu/*
+          linux-binaries-x86_64-unknown-linux-musl/*
+          appimage/*
+        draft: false
+        prerelease: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
