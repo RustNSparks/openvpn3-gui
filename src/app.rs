@@ -334,7 +334,8 @@ impl OpenVPN3App {
         if matches!(
             self.connection_status,
             ConnectionStatus::AuthenticationRequired { .. }
-        ) && ui.button("Enter Credentials").clicked() {
+        ) && ui.button("Enter Credentials").clicked()
+        {
             self.show_auth_dialog = true;
         }
 
