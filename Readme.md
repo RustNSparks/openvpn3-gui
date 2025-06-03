@@ -281,10 +281,6 @@ RUST_LOG=debug ./openvpn3-gui
 2. Review OpenVPN3 Linux documentation
 3. Enable debug logging and include logs when reporting issues
 
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
 ### Development Setup
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature-name`
