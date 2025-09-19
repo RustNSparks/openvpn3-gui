@@ -1,4 +1,4 @@
-// src/app.rs (Complete implementation with Error handling)
+// src/app.rs (Fixed version with proper configuration handling)
 use crate::config::AppConfig;
 use crate::openvpn::{
     ConfigProfile, ConnectionStatus, OpenVPN3Manager, SessionInfo, SessionStats, VpnMessage,
@@ -213,9 +213,21 @@ impl OpenVPN3App {
                 }
                 VpnMessage::ConfigsList(configs) => {
                     self.configs_list = configs;
+                    // Auto-select the first config if none selected and configs exist
+                    if self.selected_config_idx.is_none() && !self.configs_list.is_empty() {
+                        self.selected_config_idx = Some(0);
+                    }
+                    self.add_log_entry(format!(
+                        "Loaded {} configurations",
+                        self.configs_list.len()
+                    ));
                 }
                 VpnMessage::ConfigImported(msg) => {
                     self.add_log_entry(format!("Config imported: {}", msg));
+                    // Request refresh of config list after import
+                    if let Some(ref manager) = self.vpn_manager {
+                        let _ = manager.list_configs();
+                    }
                 }
                 VpnMessage::VpnCliVersion(version) => {
                     self.vpn_cli_version = Some(version);
@@ -344,23 +356,45 @@ impl OpenVPN3App {
         // Configuration selection
         ui.horizontal(|ui| {
             ui.label("Configuration:");
-            let selected_text = self
-                .selected_config_idx
-                .and_then(|idx| self.configs_list.get(idx))
-                .map_or("Select configuration", |c| &c.name);
 
-            egui::ComboBox::from_id_salt("config_combobox")
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    for (i, config_profile) in self.configs_list.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.selected_config_idx,
-                            Some(i),
-                            &config_profile.name,
-                        );
+            if self.configs_list.is_empty() {
+                ui.label("No configurations available. Please import a configuration file.");
+                if ui.button("Go to Configurations").clicked() {
+                    self.active_tab = ActiveTab::Configurations;
+                }
+            } else {
+                let selected_text = self
+                    .selected_config_idx
+                    .and_then(|idx| self.configs_list.get(idx))
+                    .map_or("Select configuration", |c| &c.name);
+
+                egui::ComboBox::from_id_salt("config_combobox")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for (i, config_profile) in self.configs_list.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.selected_config_idx,
+                                Some(i),
+                                &config_profile.name,
+                            );
+                        }
+                    });
+
+                if ui
+                    .button("🔄")
+                    .on_hover_text("Refresh configuration list")
+                    .clicked()
+                    && let Some(ref manager) = self.vpn_manager {
+                        let _ = manager.list_configs();
                     }
-                });
+            }
         });
+
+        // Debug info - show selected config details
+        if let Some(idx) = self.selected_config_idx
+            && let Some(config) = self.configs_list.get(idx) {
+                ui.label(format!("Selected: {} (Path: {})", config.name, config.path));
+            }
 
         // Connection controls
         ui.horizontal(|ui| {
@@ -378,14 +412,17 @@ impl OpenVPN3App {
             if ui
                 .add_enabled(can_connect, egui::Button::new("Connect"))
                 .clicked()
-            {
-                if let Some(idx) = self.selected_config_idx {
-                    let config_name = self.configs_list.get(idx).map(|c| c.name.clone());
-                    if let Some(name) = config_name {
-                        self.connect_vpn(&name);
+                && let Some(idx) = self.selected_config_idx
+                    && let Some(config) = self.configs_list.get(idx) {
+                        // Use the config path if it starts with /net/openvpn, otherwise use the name
+                        let identifier =
+                            if config.path.starts_with("/net/openvpn/v3/configuration/") {
+                                config.path.clone()
+                            } else {
+                                config.name.clone()
+                            };
+                        self.connect_vpn(&identifier);
                     }
-                }
-            }
 
             if ui
                 .add_enabled(can_disconnect, egui::Button::new("Disconnect"))
@@ -394,21 +431,19 @@ impl OpenVPN3App {
                 self.disconnect_vpn();
             }
 
-            if ui.button("Refresh Status").clicked() {
-                if let Some(ref manager) = self.vpn_manager {
+            if ui.button("Refresh Status").clicked()
+                && let Some(ref manager) = self.vpn_manager {
                     let _ = manager.get_status_update();
                 }
-            }
         });
     }
 
     fn draw_sessions_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Active Sessions");
-        if ui.button("Refresh Sessions").clicked() {
-            if let Some(ref manager) = self.vpn_manager {
+        if ui.button("Refresh Sessions").clicked()
+            && let Some(ref manager) = self.vpn_manager {
                 let _ = manager.list_sessions();
             }
-        }
         ui.separator();
 
         if self.sessions_list.is_empty() {
@@ -434,17 +469,23 @@ impl OpenVPN3App {
             if ui.button("Import Config File").clicked() {
                 self.show_import_config_dialog = true;
             }
-            if ui.button("Refresh List").clicked() {
-                if let Some(ref manager) = self.vpn_manager {
+            if ui.button("Refresh List").clicked()
+                && let Some(ref manager) = self.vpn_manager {
                     let _ = manager.list_configs();
                 }
-            }
         });
         ui.separator();
 
         if self.configs_list.is_empty() {
-            ui.label("No configurations found by the manager.");
+            ui.label(
+                "No configurations found. Click 'Import Config File' to add your .ovpn files.",
+            );
         } else {
+            ui.label(format!(
+                "Found {} configuration(s):",
+                self.configs_list.len()
+            ));
+
             let mut action_remove: Option<String> = None;
             let mut action_dump: Option<String> = None;
 
@@ -503,11 +544,10 @@ impl OpenVPN3App {
 
     fn draw_statistics_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Connection Statistics");
-        if ui.button("Refresh Stats").clicked() {
-            if let Some(ref manager) = self.vpn_manager {
+        if ui.button("Refresh Stats").clicked()
+            && let Some(ref manager) = self.vpn_manager {
                 let _ = manager.get_session_stats();
             }
-        }
         ui.separator();
 
         if let Some(ref stats) = self.session_stats {
@@ -571,24 +611,22 @@ impl OpenVPN3App {
 
         // Handle checkbox changes after the UI section
         if manager_exists {
-            if live_logs_changed {
-                if let Some(ref manager) = self.vpn_manager {
+            if live_logs_changed
+                && let Some(ref manager) = self.vpn_manager {
                     if self.live_vpn_logs_active {
                         let _ = manager.start_live_vpn_logs();
                     } else {
                         let _ = manager.stop_live_vpn_logs();
                     }
                 }
-            }
-            if manager_logs_changed {
-                if let Some(ref manager) = self.vpn_manager {
+            if manager_logs_changed
+                && let Some(ref manager) = self.vpn_manager {
                     if self.manager_log_buffer_active {
                         let _ = manager.enable_manager_log_buffer();
                     } else {
                         let _ = manager.disable_manager_log_buffer();
                     }
                 }
-            }
         }
 
         ui.separator();
@@ -659,11 +697,10 @@ impl OpenVPN3App {
             } else {
                 ui.label("CLI Version: Unknown");
             }
-            if ui.button("Refresh CLI Version").clicked() {
-                if let Some(ref manager) = self.vpn_manager {
+            if ui.button("Refresh CLI Version").clicked()
+                && let Some(ref manager) = self.vpn_manager {
                     let _ = manager.get_vpn_cli_version();
                 }
-            }
         });
 
         ui.separator();
@@ -695,14 +732,19 @@ impl OpenVPN3App {
                         let text_edit = egui::TextEdit::singleline(&mut self.import_config_path)
                             .desired_width(300.0);
                         ui.add(text_edit);
-                        if ui.button("Browse...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                        if ui.button("Browse...").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("OpenVPN Config", &["ovpn", "conf"])
                                 .pick_file()
                             {
                                 self.import_config_path = path.display().to_string();
+                                // Auto-fill name from filename if name is empty
+                                if self.import_config_name.is_empty()
+                                    && let Some(filename) = path.file_stem() {
+                                        self.import_config_name =
+                                            filename.to_string_lossy().to_string();
+                                    }
                             }
-                        }
                     });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -718,6 +760,14 @@ impl OpenVPN3App {
                                         .to_string(),
                                 );
                             } else if let Some(ref manager) = self.vpn_manager {
+                                // self.add_log_entry(format!(
+                                //     "Importing config '{}' from '{}'",
+                                //     self.import_config_name, self.import_config_path
+                                // ));
+                                println!(
+                                    "Importing config '{}' from '{}'",
+                                    self.import_config_name, self.import_config_path
+                                );
                                 let _ = manager.import_config(
                                     self.import_config_path.clone(),
                                     self.import_config_name.clone(),
@@ -856,13 +906,18 @@ impl OpenVPN3App {
                         if ui.button("Retry Connection").clicked() {
                             self.show_error_dialog = false;
                             self.current_error_message.clear();
-                            if let Some(idx) = self.selected_config_idx {
-                                let config_name =
-                                    self.configs_list.get(idx).map(|c| c.name.clone());
-                                if let Some(name) = config_name {
-                                    self.connect_vpn(&name);
+                            if let Some(idx) = self.selected_config_idx
+                                && let Some(config) = self.configs_list.get(idx) {
+                                    let identifier = if config
+                                        .path
+                                        .starts_with("/net/openvpn/v3/configuration/")
+                                    {
+                                        config.path.clone()
+                                    } else {
+                                        config.name.clone()
+                                    };
+                                    self.connect_vpn(&identifier);
                                 }
-                            }
                         }
                     });
                 });
@@ -935,11 +990,10 @@ impl eframe::App for OpenVPN3App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.add_log_entry("Application exiting. Shutting down VPN manager.".to_string());
-        if let Some(ref manager) = self.vpn_manager {
-            if let Err(e) = manager.shutdown() {
+        if let Some(ref manager) = self.vpn_manager
+            && let Err(e) = manager.shutdown() {
                 eprintln!("Failed to send shutdown command to manager: {}", e);
             }
-        }
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save app config on exit: {}", e);
         }

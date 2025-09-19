@@ -359,10 +359,10 @@ impl OpenVPN3Manager {
                     self.log_manager_message(format!("Status update error: {}", e));
                 }
 
-                if matches!(self.get_status(), ConnectionStatus::Connected { .. }) {
-                    if let Err(e) = self.handle_get_session_stats().await {
-                        self.log_manager_message(format!("Stats update error: {}", e));
-                    }
+                if matches!(self.get_status(), ConnectionStatus::Connected { .. })
+                    && let Err(e) = self.handle_get_session_stats().await
+                {
+                    self.log_manager_message(format!("Stats update error: {}", e));
                 }
 
                 let current_status = self.get_status();
@@ -529,63 +529,49 @@ impl OpenVPN3Manager {
     }
 
     async fn update_connection_status(&self) -> Result<()> {
+        // We now primarily use `sessions-list` as it's more reliable for status.
+        let list_output = TokioCommand::new("openvpn3")
+            .arg("sessions-list")
+            .output()
+            .await?;
+
+        if !list_output.status.success() {
+            // If the command fails, assume disconnected
+            self.set_status(ConnectionStatus::Disconnected);
+            return Err(anyhow!("Failed to list sessions for status update."));
+        }
+
+        let list_output_str = String::from_utf8_lossy(&list_output.stdout);
+        let sessions = self.parse_sessions_list(&list_output_str);
         let session_path_opt = self.current_session_path.lock().unwrap().clone();
 
         if let Some(session_path) = session_path_opt {
-            let output = TokioCommand::new("openvpn3")
-                .args(["session-stats", "--session-path", &session_path])
-                .output()
-                .await?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("Invalid session path") || stderr.contains("not found") {
-                    self.log_manager_message(format!(
-                        "Session {} no longer valid. Marking as Disconnected.",
-                        session_path
-                    ));
-                    *self.current_session_path.lock().unwrap() = None;
-                    self.set_status(ConnectionStatus::Disconnected);
-                } else {
-                    self.set_status(ConnectionStatus::Error(format!(
-                        "Failed to get session status for {}: {}",
-                        session_path, stderr
-                    )));
-                }
-                return Ok(());
-            }
-
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            let new_status = self.parse_status_from_session_output(&output_str, &session_path);
-
-            if let ConnectionStatus::AuthenticationRequired { .. } = new_status {
-                if !matches!(
-                    self.get_status(),
-                    ConnectionStatus::AuthenticationRequired { .. }
-                ) {
-                    self.set_status(new_status.clone());
-                    if let ConnectionStatus::AuthenticationRequired {
-                        session_path,
-                        prompt,
-                    } = new_status
-                    {
-                        self.send_message_to_ui(VpnMessage::AuthenticationPrompt {
-                            session_path,
-                            prompt,
-                        });
+            if let Some(active_session) = sessions.iter().find(|s| s.session_path == session_path) {
+                // Check for the specific connected status message you provided
+                if active_session
+                    .status
+                    .contains("Connection, Client connected")
+                {
+                    let new_status = ConnectionStatus::Connected {
+                        // This info isn't in your output, so we provide placeholders
+                        ip: "Assigned".to_string(),
+                        duration: active_session.created.clone(),
+                    };
+                    if self.status_changed(&self.get_status(), &new_status) {
+                        self.set_status(new_status);
                     }
+                } else {
+                    // If the status is not "Client connected", we assume it's still connecting
+                    self.set_status(ConnectionStatus::Connecting);
                 }
-            } else if self.status_changed(&self.get_status(), &new_status) {
-                self.set_status(new_status);
-            }
-        } else {
-            let current_internal_status = self.get_status();
-            if !matches!(
-                current_internal_status,
-                ConnectionStatus::Disconnected | ConnectionStatus::Error(_)
-            ) {
+            } else {
+                // Session path is known, but it's not in the list anymore, so it's disconnected
+                *self.current_session_path.lock().unwrap() = None;
                 self.set_status(ConnectionStatus::Disconnected);
             }
+        } else {
+            // No session path is being tracked, so we are disconnected.
+            self.set_status(ConnectionStatus::Disconnected);
         }
         Ok(())
     }
@@ -595,8 +581,19 @@ impl OpenVPN3Manager {
         output_str: &str,
         session_path: &str,
     ) -> ConnectionStatus {
-        if output_str.to_lowercase().contains("status: connected")
-            || output_str.to_lowercase().contains("connection initiated")
+        let lower_output = output_str.to_lowercase();
+
+        // Prioritize checking for a Virtual IP, as it's a strong indicator of a connection.
+        if let Some(ip) = self.extract_field(output_str, "Virtual IP:") {
+            let duration = self
+                .extract_field(output_str, "Connected since:")
+                .or_else(|| self.extract_field(output_str, "Duration:"))
+                .unwrap_or_else(|| "N/A".to_string());
+            return ConnectionStatus::Connected { ip, duration };
+        }
+
+        if lower_output.contains("status: connected")
+            || lower_output.contains("connection initiated")
         {
             let ip = self
                 .extract_field(output_str, "Virtual IP:")
@@ -606,17 +603,17 @@ impl OpenVPN3Manager {
                 .or_else(|| self.extract_field(output_str, "Duration:"))
                 .unwrap_or_else(|| "N/A".to_string());
             ConnectionStatus::Connected { ip, duration }
-        } else if output_str.to_lowercase().contains("status: connecting") {
+        } else if lower_output.contains("status: connecting") {
             ConnectionStatus::Connecting
-        } else if output_str.to_lowercase().contains("status: authenticating")
-            || output_str.to_lowercase().contains("auth_pending")
+        } else if lower_output.contains("status: authenticating")
+            || lower_output.contains("auth_pending")
         {
             ConnectionStatus::AuthenticationRequired {
                 session_path: session_path.to_string(),
                 prompt: "Authentication is pending. Please provide credentials.".to_string(),
             }
-        } else if output_str.to_lowercase().contains("status: disconnected")
-            || output_str.to_lowercase().contains("status: exited")
+        } else if lower_output.contains("status: disconnected")
+            || lower_output.contains("status: exited")
         {
             ConnectionStatus::Disconnected
         } else {
@@ -831,11 +828,13 @@ impl OpenVPN3Manager {
 
     async fn handle_dump_config(&self, config_identifier: &str) -> Result<()> {
         let mut cmd = TokioCommand::new("openvpn3");
-        cmd.arg("config-dump");
+        cmd.arg("config-dump"); // Correct command name
         if config_identifier.starts_with("/net/openvpn/v3/configuration/") {
+            // Using --path for D-Bus paths is correct
             cmd.args(["--path", config_identifier]);
         } else {
-            cmd.args(["--name", config_identifier]);
+            // CORRECTED: Using --config for configuration names, as per your man page
+            cmd.args(["--config", config_identifier]);
         }
 
         let output = cmd.output().await?;
@@ -847,6 +846,8 @@ impl OpenVPN3Manager {
             ));
         }
         let content = String::from_utf8_lossy(&output.stdout).to_string();
+
+        // This logic to find the display name remains correct
         let name = if config_identifier.starts_with("/net/openvpn/v3/configuration/") {
             self.configs
                 .lock()
@@ -861,7 +862,6 @@ impl OpenVPN3Manager {
         self.send_message_to_ui(VpnMessage::ConfigDumped { name, content });
         Ok(())
     }
-
     async fn handle_submit_authentication(&self, session_path: &str, response: &str) -> Result<()> {
         self.log_manager_message(format!(
             "Submitting authentication for session: {}",
@@ -918,27 +918,28 @@ impl OpenVPN3Manager {
         let mut sessions = Vec::new();
         let mut current_session: Option<SessionInfo> = None;
 
-        for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if line.starts_with("Session path:") {
+        for line in output.lines() {
+            let trimmed_line = line.trim();
+            if trimmed_line.starts_with("Path:") {
                 if let Some(session) = current_session.take() {
                     sessions.push(session);
                 }
                 current_session = Some(SessionInfo {
-                    session_path: self.extract_value(line, "Session path:"),
+                    session_path: self.extract_value(trimmed_line, "Path:"),
                     config_name: String::new(),
                     status: String::new(),
                     created: String::new(),
                     owner: String::new(),
                 });
             } else if let Some(session) = current_session.as_mut() {
-                if line.starts_with("Config name:") {
-                    session.config_name = self.extract_value(line, "Config name:");
-                } else if line.starts_with("Status:") {
-                    session.status = self.extract_value(line, "Status:");
-                } else if line.starts_with("Created:") {
-                    session.created = self.extract_value(line, "Created:");
-                } else if line.starts_with("Owner:") {
-                    session.owner = self.extract_value(line, "Owner:");
+                if trimmed_line.starts_with("Config name:") {
+                    session.config_name = self.extract_value(trimmed_line, "Config name:");
+                } else if trimmed_line.starts_with("Status:") {
+                    session.status = self.extract_value(trimmed_line, "Status:");
+                } else if trimmed_line.starts_with("Created:") {
+                    session.created = self.extract_value(trimmed_line, "Created:");
+                } else if trimmed_line.starts_with("Owner:") {
+                    session.owner = self.extract_value(trimmed_line, "Owner:");
                 }
             }
         }
@@ -950,32 +951,26 @@ impl OpenVPN3Manager {
 
     fn parse_configs_list(&self, output: &str) -> Vec<ConfigProfile> {
         let mut configs = Vec::new();
-        let mut current_config: Option<ConfigProfile> = None;
+        let lines = output.lines().skip(2); // Skip header lines
 
-        for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if line.starts_with("Configuration path:") {
-                if let Some(config) = current_config.take() {
-                    configs.push(config);
-                }
-                current_config = Some(ConfigProfile {
-                    path: self.extract_value(line, "Configuration path:"),
-                    name: String::new(),
-                    import_time: String::new(),
-                    owner: String::new(),
-                    valid: true,
-                });
-            } else if let Some(config) = current_config.as_mut() {
-                if line.starts_with("Configuration name:") {
-                    config.name = self.extract_value(line, "Configuration name:");
-                } else if line.starts_with("Imported:") {
-                    config.import_time = self.extract_value(line, "Imported:");
-                } else if line.starts_with("Owner:") {
-                    config.owner = self.extract_value(line, "Owner:");
-                }
+        for line in lines {
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() || trimmed_line.starts_with("---") {
+                continue;
             }
-        }
-        if let Some(config) = current_config.take() {
-            configs.push(config);
+
+            let parts: Vec<&str> = trimmed_line.split_whitespace().collect();
+            if let Some(name) = parts.first() {
+                configs.push(ConfigProfile {
+                    name: name.to_string(),
+                    // Path is not available in this output format, so we'll use the name as a placeholder
+                    path: name.to_string(),
+                    // Other fields are also not available, so we'll use default values
+                    import_time: "N/A".to_string(),
+                    owner: "N/A".to_string(),
+                    valid: true, // Assuming configs listed are valid
+                });
+            }
         }
         configs
     }
@@ -999,30 +994,47 @@ impl OpenVPN3Manager {
         let mut found_any = false;
 
         for line in output.lines() {
-            if let Some(val_str) = self.extract_field(line, "Bytes received:") {
-                stats.bytes_in = val_str.parse().unwrap_or(0);
-                found_any = true;
-            } else if let Some(val_str) = self.extract_field(line, "Bytes sent:") {
-                stats.bytes_out = val_str.parse().unwrap_or(0);
-                found_any = true;
-            } else if let Some(val_str) = self.extract_field(line, "Packets received:") {
-                stats.packets_in = val_str.parse().unwrap_or(0);
-                found_any = true;
-            } else if let Some(val_str) = self.extract_field(line, "Packets sent:") {
-                stats.packets_out = val_str.parse().unwrap_or(0);
-                found_any = true;
-            } else if let Some(val_str) = self.extract_field(line, "Connected since:") {
-                stats.connected_since = val_str;
-                found_any = true;
-            } else if let Some(val_str) = self.extract_field(line, "Virtual IP:") {
-                stats.virtual_ip = val_str;
-                found_any = true;
-            } else if let Some(val_str) = self.extract_field(line, "Remote IP:") {
-                stats.remote_ip = val_str;
+            let line = line.trim();
+
+            // Parse connection statistics format (BYTES_IN, BYTES_OUT, etc.)
+            if line.contains("BYTES_IN") {
+                if let Some(val) = self.extract_dots_value(line) {
+                    stats.bytes_in = val.parse().unwrap_or(0);
+                    found_any = true;
+                }
+            } else if line.contains("BYTES_OUT") {
+                if let Some(val) = self.extract_dots_value(line) {
+                    stats.bytes_out = val.parse().unwrap_or(0);
+                    found_any = true;
+                }
+            } else if line.contains("PACKETS_IN") && !line.contains("TUN_") {
+                if let Some(val) = self.extract_dots_value(line) {
+                    stats.packets_in = val.parse().unwrap_or(0);
+                    found_any = true;
+                }
+            } else if line.contains("PACKETS_OUT")
+                && !line.contains("TUN_")
+                && let Some(val) = self.extract_dots_value(line)
+            {
+                stats.packets_out = val.parse().unwrap_or(0);
                 found_any = true;
             }
         }
+
         if found_any { Some(stats) } else { None }
+    }
+
+    fn extract_dots_value(&self, line: &str) -> Option<String> {
+        // Split by dots pattern - find where multiple dots appear
+        if let Some(dots_pos) = line.find("..") {
+            let (_, value_part) = line.split_at(dots_pos);
+            // Skip all dots and get the value
+            let value = value_part.trim_start_matches('.').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        None
     }
 
     fn extract_field(&self, text: &str, field_key: &str) -> Option<String> {
